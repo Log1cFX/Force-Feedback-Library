@@ -1,85 +1,118 @@
 # Force Feedback Library
 
-A standalone C++ force-feedback library extracted from the
-[OpenFFBoard](https://github.com/Ultrawipf/OpenFFBoard) firmware. The
-effect math is bit-for-bit identical to the original; the project-specific
-glue (STM32 HAL, TinyUSB, FreeRTOS, flash storage, configurator CLI) has
-been stripped so the library drops into any bare-metal microcontroller
-project.
+A standalone C++ force-feedback engine extracted from the
+[OpenFFBoard](https://github.com/Ultrawipf/OpenFFBoard) firmware. It decodes the
+USB force-feedback reports a game sends, runs the effect math, and hands you a
+single torque value per axis to drive your motor. The effect math is a faithful
+port of the original and produces the same forces; all the project-specific glue
+(STM32 HAL, TinyUSB, FreeRTOS, flash storage, the configurator CLI) has been
+removed so the library drops into any bare-metal microcontroller project.
+
+- **No heap** — the effect pool and all filters live inside the `Library` object.
+- **No RTOS** — a plain polled engine; you call it once per control tick.
+- **No dependencies** — just C++11, with a plain-C wrapper for C projects.
+- **USB-stack / motor / encoder agnostic** — you wire those up.
+
+> **Full guide:** see **[DOCUMENTATION.md](DOCUMENTATION.md)**. Part I is a
+> step-by-step usage walkthrough (C++ **and** C); Part II explains the internals.
 
 ## What it does
 
-The library:
+- Decodes USB HID PID reports from the host — Constant, Ramp, Periodic
+  (Sine / Square / Triangle / Sawtooth), Spring, Damper, Friction and Inertia,
+  with envelope shaping and condition blocks.
+- Maintains a fixed-size pool of effect slots (no allocation at runtime).
+- Computes the torque per axis every tick.
+- Ships a ready-to-use HID report descriptor (1-axis and 2-axis variants).
 
-- Decodes USB HID PID reports from the host (DirectInput force-feedback
-  effects: Constant, Ramp, Periodic, Spring, Damper, Friction, Inertia,
-  Envelope shaping, conditions).
-- Maintains a fixed-size pool of effect slots.
-- Computes torque per axis every tick.
-- Ships a ready-to-use HID Report Descriptor (1-axis and 2-axis variants).
+It does **not** care which USB stack (TinyUSB, ST USB, LUFA, …), motor driver
+(PWM, BLDC/FOC, CAN, …) or encoder you use, or whether you run an RTOS — those
+are yours to wire up.
 
-It does **not** care about:
+## Quick start
 
-- Which USB stack you use (TinyUSB, ST USB, LUFA, anything).
-- Which motor driver you use (PWM, BLDC controller, CAN, anything).
-- Which encoder you use.
-- Whether you have an RTOS.
-
-## In 60 seconds
+The whole contract: feed it the host's USB reports and the wheel state, read back
+a torque.
 
 ```cpp
 #include "ffb/ffb.h"
 
-// 1. One-time setup
+// 1. One-time setup (1-axis device).
 ffb::Library lib(/*axis_count=*/1, { my_millis, my_micros });
-lib.setSendReportCallback(my_usb_send);
+lib.setSendReportCallback(my_usb_send);            // optional status reports
 
-// 2. Hand the descriptor to your USB stack
+// 2. Hand the HID report descriptor to your USB stack at enumeration.
 uint16_t len;
 const uint8_t* desc = ffb::Library::descriptor1Axis(&len);
 my_usb_set_hid_descriptor(desc, len);
 
-// 3. In your USB Set/Get Report callbacks
+// 3. Forward the host's reports from your USB Set/Get Report callbacks.
 void on_usb_set_report(uint8_t id, const uint8_t* buf, uint16_t n) { lib.hidOut(id, buf, n); }
 uint16_t on_usb_get_report(uint8_t id, uint8_t* buf, uint16_t n)   { return lib.hidGet(id, buf, n); }
 
-// 4. Every FFB tick (1 kHz default)
+// 4. Every control tick (1 kHz default).
 lib.setAxisState(0, { wheel_pos_int16, wheel_speed_dps, wheel_accel_dpss });
 lib.calculate();
-int32_t torque = lib.getAxisTorque(0);   // -0x7fff .. 0x7fff
+int32_t torque = lib.getAxisTorque(0);             // -0x7fff .. 0x7fff
 ```
+
+The same five steps in C, via `ffb/ffb_c.h`:
+
+```c
+#include "ffb/ffb_c.h"
+
+ffb_lib_t* lib = ffb_create(1, my_millis, my_micros);
+ffb_set_send_report_callback(lib, my_usb_send);
+
+uint16_t len;
+const uint8_t* desc = ffb_descriptor_1axis(&len);
+my_usb_set_hid_descriptor(desc, len);
+
+/* in your USB callbacks */
+ffb_hid_out(lib, id, buf, n);
+uint16_t got = ffb_hid_get(lib, id, buf, n);
+
+/* per tick */
+ffb_set_axis_state(lib, 0, wheel_pos_int16, wheel_speed_dps, wheel_accel_dpss);
+ffb_calculate(lib);
+int32_t torque = ffb_get_axis_torque(lib, 0);
+```
+
+See [DOCUMENTATION.md](DOCUMENTATION.md) for the units, the per-step breakdown,
+and TinyUSB wiring.
 
 ## Library layout
 
 ```
-ffb-lib/
-├── include/ffb/
-│   ├── ffb.h              Main facade (the only header most users need)
-│   ├── ffb_c.h            Plain-C wrapper
-│   ├── ffb_config.h       Compile-time knobs (FFB_MAX_AXIS, FFB_MAX_EFFECTS)
-│   ├── ffb_descriptor.h   Pre-built HID descriptor + assembly macros
-│   ├── ffb_calculator.h   The math engine (advanced)
-│   ├── ffb_parser.h       The USB report decoder (advanced)
-│   ├── ffb_effect.h       Internal Effect struct
-│   ├── ffb_biquad.h       Biquad filter
-│   ├── ffb_metrics.h      Optional: derives speed/accel from raw position
-│   ├── ffb_axis_local.h   Optional: idle spring, endstop, axis-local effects
-│   ├── ffb_metrics_c.h    Optional: C wrapper for ffb_metrics.h
-│   └── ffb_axis_local_c.h Optional: C wrapper for ffb_axis_local.h
-├── src/                   Implementations
-├── examples/
-│   ├── minimal_cpp.cpp    Smallest C++ integration
-│   ├── minimal_c.c        Same, using the C API
-│   ├── c_wrappers.c       C API + metrics/axis-local helpers + tuning
-│   ├── tinyusb_glue.cpp   TinyUSB report-callback wiring
-│   └── usb_descriptors_tinyusb.c  Device/config/string descriptors you supply
-└── CMakeLists.txt
+include/ffb/
+├── ffb.h              Main facade (the only header most users need)
+├── ffb_c.h            Plain-C wrapper
+├── ffb_config.h       Compile-time knobs (FFB_MAX_AXIS, FFB_MAX_EFFECTS, …)
+├── ffb_descriptor.h   Pre-built HID descriptor + assembly macros
+├── ffb_calculator.h   The math engine (advanced)
+├── ffb_parser.h       The USB report decoder (advanced)
+├── ffb_effect.h       Internal Effect struct
+├── ffb_biquad.h       Biquad filter
+├── ffb_metrics.h      Optional: derive speed/accel from raw position
+├── ffb_axis_local.h   Optional: idle spring, end-stop, axis-local effects
+├── ffb_metrics_c.h    Optional: C wrapper for ffb_metrics.h
+└── ffb_axis_local_c.h Optional: C wrapper for ffb_axis_local.h
+src/                   Implementations
+examples/
+├── minimal_cpp.cpp           Smallest C++ integration
+├── minimal_c.c               Same, using the C API
+├── c_wrappers.c              C API + metrics/axis-local helpers + tuning
+├── tinyusb_glue.cpp          TinyUSB report-callback wiring
+└── usb_descriptors_tinyusb.c Device/config/string descriptors you supply
+tests/smoke_test.cpp   Smoke test
+CMakeLists.txt
+DOCUMENTATION.md
 ```
 
 ## Compile-time configuration
 
-Override these by defining them before including any `ffb/*` header, or
-on the compiler command line (`-DFFB_MAX_AXIS=1`):
+Override these before including any `ffb/*` header, or on the compiler command
+line (`-DFFB_MAX_AXIS=1`):
 
 | Macro | Default | Purpose |
 |---|---|---|
@@ -91,39 +124,55 @@ on the compiler command line (`-DFFB_MAX_AXIS=1`):
 
 ## Platform requirements
 
-You must supply two functions:
+Supply two free-running counters:
 
 ```c
-uint32_t millis(void);  // free-running millisecond counter
-uint32_t micros(void);  // free-running microsecond counter
+uint32_t millis(void);  // milliseconds since boot
+uint32_t micros(void);  // microseconds since boot
 ```
 
-Both can wrap around — the library only uses deltas. If your MCU only
-has `millis()`, derive `micros()` from any hardware timer.
+Both may wrap around — the library only uses deltas. If your MCU has only
+`millis()`, derive `micros()` from any hardware timer.
 
-That's it. No heap is needed at runtime: the library allocates its
-effect pool and biquad filters statically. The memory footprint with
-defaults (`FFB_MAX_EFFECTS=40`, `FFB_MAX_AXIS=2`) is about 9 KB BSS.
+No heap is used at runtime: the effect pool and biquad filters are allocated
+statically inside the `Library`. With defaults (`FFB_MAX_EFFECTS=40`,
+`FFB_MAX_AXIS=2`) the footprint is about **9 KB** of BSS.
 
 ## Building
 
 ```sh
 cmake -B build
-cmake --build build
-# produces libffb.a
+cmake --build build        # produces libffb.a
 ```
 
-Or just add the `src/*.cpp` files to your existing build and put `include/`
-on the include path.
+Options: `-DFFB_BUILD_EXAMPLES=ON`, `-DFFB_BUILD_TESTS=ON`,
+`-DFFB_BUILD_C_WRAPPER=ON` (on by default). Or just add the `src/*.cpp` files to
+your existing build and put `include/` on the include path — compile
+`ffb_metrics*.cpp` / `ffb_axis_local*.cpp` only if you use those helpers.
+
+## Optional helpers
+
+Both are independent and cost zero bytes if you don't use them:
+
+- **`ffb_metrics.h`** derives filtered speed and acceleration (and a scaled
+  position) from a raw position stream, when you don't already have them. Same
+  math as the original `Axis::updateMetrics()`.
+- **`ffb_axis_local.h`** adds the "feel" effects the host does *not* request — an
+  idle self-centering spring (when FFB is off), a software end-stop at the
+  rotation limit, and always-on damper/friction/inertia. Same math as
+  `Axis::calculateAxisEffects()` / `Axis::updateEndstop()`. You add its output on
+  top of `getAxisTorque()`.
+
+Each has a matching C wrapper (`ffb_metrics_c.h`, `ffb_axis_local_c.h`).
 
 ## What the host sees
 
-The shipped HID **report** descriptor enumerates as a standard HID joystick
-with the PID (Physical Input Device) usage page, which Windows' DirectInput
-stack recognises as a force-feedback device. You can verify by:
+The shipped HID **report** descriptor enumerates as a standard HID joystick on
+the PID (Physical Input Device) usage page, which Windows' DirectInput stack
+recognises as a force-feedback device. Verify it by:
 
 1. Plugging in the device.
-2. Running `joy.cpl` -> Properties -> Test.
+2. Running `joy.cpl` → Properties → Test.
 3. Launching any DirectInput-aware game.
 
 > **You still write your own USB configuration descriptor.** The library only
@@ -131,7 +180,7 @@ stack recognises as a force-feedback device. You can verify by:
 > *string* descriptors (VID/PID, endpoints, product name) are yours to supply.
 > The HID interface must expose an **OUT** endpoint as well as an IN endpoint
 > (FFB is host-driven), e.g. TinyUSB's `TUD_HID_INOUT_DESCRIPTOR`. See
-> `examples/usb_descriptors_tinyusb.c` and DOCUMENTATION.md §2.3.
+> `examples/usb_descriptors_tinyusb.c` and DOCUMENTATION.md (Part I §6).
 
 ## Supported effects
 
@@ -143,26 +192,14 @@ All standard DirectInput PID effects:
 | Ramp | Linear interpolation start → end |
 | Sine, Square, Triangle, Saw Up/Down | Periodic generators with phase + offset |
 | Spring | Coefficient × (position − cpOffset), deadband + saturation |
-| Damper | Same but on filtered velocity |
-| Inertia | Same but on filtered acceleration |
-| Friction | Velocity-based with sinusoidal ramp-up below a configurable speed threshold |
-| Envelope | Attack/sustain/fade modulation applied on top of magnitude |
+| Damper | Same, on filtered velocity |
+| Inertia | Same, on filtered acceleration |
+| Friction | Velocity-based, with a sinusoidal ramp-up below a configurable speed threshold |
+| Envelope | Attack/sustain/fade modulation on top of magnitude |
 | Conditions | Single or per-axis condition parameter blocks |
 
-The math is copied byte-for-byte from OpenFFBoard's `EffectsCalculator.cpp`.
-
-## Opt-in helpers
-
-`ffb_metrics.h` derives filtered speed and acceleration from a raw
-position stream, if you don't already have those. Same math as the
-original `Axis::updateMetrics()`.
-
-`ffb_axis_local.h` provides the "feel" effects that are NOT requested
-by the host (idle self-centring spring when FFB is off, software endstop,
-always-on damper/friction/inertia). Same math as `Axis::calculateAxisEffects()`.
-
-Both are independent — include only what you want. If you skip them,
-neither file is compiled into your binary.
+The math is a faithful port of OpenFFBoard's `EffectsCalculator.cpp` and produces
+the same forces.
 
 ## Testing
 This library has been tested on one of my own projects to make an FFB steering 
