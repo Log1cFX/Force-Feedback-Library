@@ -120,7 +120,9 @@ int main(void) {
         ffb_calculate(lib);
         int32_t host_torque = ffb_get_axis_torque(lib, 0);
 
-        /* Add the local "feel" torque (idle spring / endstop / damper). */
+        /* Add the local "feel" torque (idle spring / endstop / damper). It is
+         * worked out from `st` alone; the angle argument is kept for source
+         * compatibility and no longer used. */
         int32_t local_torque =
             ffb_axis_local_compute(local, &st, raw_deg, ffb_is_active(lib));
 

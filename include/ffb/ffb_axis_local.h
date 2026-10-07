@@ -64,7 +64,8 @@ struct AxisLocalConfig {
     uint8_t friction_intensity   = 0;
     uint8_t inertia_intensity    = 0;
 
-    /* Wheel range (full rotation in degrees). */
+    /* Wheel range (full rotation in degrees). Use the same value as for the
+     * metrics helper: the end-stop converts its overshoot to degrees with it. */
     float   degrees_of_rotation  = 900.0f;
 
     /* Filter coefficients - defaults match Axis::filter*Cst. */
@@ -81,29 +82,34 @@ public:
 
     /* Compute the per-axis "feel" torque to add on top of HID-requested
      * effects. Returns a value in -0x7fff..0x7fff. Add this to
-     * Library::getAxisTorque(axis) before applying to the motor. */
+     * Library::getAxisTorque(axis) before applying to the motor.
+     *
+     * Everything is derived from `metrics`. The end-stop engages where
+     * metrics.pos_scaled_16b leaves +/-0x7fff, so that value must not be
+     * clamped (the metrics helper leaves it un-clamped for this reason).
+     * pos_degrees is accepted for source compatibility and not used. */
     int32_t compute(const AxisState& metrics, float pos_degrees, bool ffb_on);
 
     /* Update samplerate (rebuilds filter coefficients). */
     void setSamplerate(float hz);
 
-    /* Retune the idle-spring strength at runtime. Needed because the
-     * derived scale/clip values are cached at construction; writing
-     * config().idle_spring_strength directly would not take effect. */
+    /* Retune the idle-spring strength at runtime. Same effect as writing
+     * config().idle_spring_strength. */
     void setIdleSpringStrength(uint8_t strength);
 
+    /* Live settings: the strengths/intensities and degrees_of_rotation are
+     * read on every compute(). After changing a filter's freq/q, call
+     * setSamplerate() to rebuild its coefficients. */
     AxisLocalConfig& config() { return cfg; }
 
 private:
     int32_t updateIdleSpring(int32_t pos_scaled_16b) const;
-    int32_t updateEndstop(int32_t pos_scaled_16b, float pos_degrees) const;
+    int32_t updateEndstop(int32_t pos_scaled_16b) const;
 
     AxisLocalConfig cfg;
     Biquad damper_filter;
     Biquad friction_filter;
     Biquad inertia_filter;
-    float  idle_spring_scale = 0;
-    int32_t idle_spring_clip = 0;
 };
 
 } /* namespace ffb */

@@ -87,15 +87,20 @@ typedef struct {
 } ffb_effect_filter_preset_t;
 
 /* Construct the single FFB instance. Returns a handle that survives
- * the program's lifetime. Pass NULL for the send_report callback if
- * you do not need status reports pushed back to the host. */
+ * the program's lifetime; a second call returns that same handle and
+ * ignores its arguments. axis_count is 1..FFB_MAX_AXIS (anything else is
+ * clamped - read it back with ffb_get_axis_count). millis_fn and micros_fn
+ * are free-running counters of the same clock; both may wrap. */
 ffb_lib_t* ffb_create(uint8_t axis_count,
                       ffb_time_fn_t millis_fn,
                       ffb_time_fn_t micros_fn);
 
+/* Register the sender for PID State reports. Optional: pass NULL (or never
+ * call this) if you do not need status reports pushed back to the host. */
 void ffb_set_send_report_callback(ffb_lib_t* lib, ffb_send_report_fn_t cb);
 
-/* USB receive (call from your USB stack). */
+/* USB receive (call from your USB stack). len is the number of valid bytes
+ * in buf; a report shorter than its layout is ignored. */
 void     ffb_hid_out(ffb_lib_t* lib, uint8_t report_id,
                      const uint8_t* buf, uint16_t len);
 uint16_t ffb_hid_get(ffb_lib_t* lib, uint8_t report_id,

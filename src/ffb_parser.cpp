@@ -30,14 +30,17 @@
 /*
  * ffb_parser.cpp
  *
- * Decodes the host-issued HID PID reports. Logic ported verbatim from
- * OpenFFBoard HidFFB.cpp. Differences:
+ * Decodes the host-issued HID PID reports. Logic ported from OpenFFBoard
+ * HidFFB.cpp. Differences:
  *
  *   - effects array is borrowed from the supplied Calculator instead of
  *     a std::shared_ptr<EffectsCalculator>.
  *   - HID_SendReport() (tud_hid_report) replaced by an optional callback.
  *   - logSerialDebug() calls replaced by FFB_LOG().
  *   - fxUpdateEvent() / cfUpdateEvent() telemetry removed.
+ *   - Every report is copied into its wire struct and checked for length
+ *     first, instead of being read in place through a cast.
+ *   - The Block Load reply reports the pool space that is actually free.
  */
 
 #include "ffb/ffb_parser.h"
@@ -57,6 +60,27 @@ inline T clip_t(T v, T lo, T hi) {
     if (v > hi) return hi;
     return v;
 }
+
+/* Copy an inbound report into its wire struct. `needed` is how many leading
+ * bytes the handler reads; a report shorter than that is refused, so nothing
+ * is ever read past the bytes the host sent. Longer reports are fine (the
+ * 2-axis Set Effect carries two trailing fields the engine has no use for). */
+template <typename T>
+inline bool readReport(T& out, uint8_t report_id, const uint8_t* buffer,
+                       uint16_t bufsize, uint16_t needed = sizeof(T)) {
+    (void)report_id;    /* only named in the log line */
+    if (bufsize < needed) {
+        FFB_LOG("FFB: report 0x%02x too short (%d bytes, need %d) - ignored\n",
+                report_id, bufsize, needed);
+        return false;
+    }
+    std::memcpy(&out, buffer, std::min<uint16_t>(sizeof(T), bufsize));
+    return true;
+}
+
+/* The Block Load and PID Pool replies state pool sizes in 16-bit fields. */
+static_assert(FFB_MAX_EFFECTS * sizeof(ffb::Effect) <= 0xFFFF,
+              "effect pool too large for the PID pool report: lower FFB_MAX_EFFECTS");
 } /* anonymous namespace */
 
 namespace ffb {
@@ -65,15 +89,14 @@ namespace ffb {
  * pre-fill the two Feature-reply structs (Block Load and PID Pool) the host
  * polls right after creating an effect. */
 HidParser::HidParser(Calculator& c, uint8_t axes)
-    : calc(c), axis_count(axes)
+    : calc(c), axis_count(clip_t<uint8_t>(axes, 1, FFB_MAX_AXIS))
 {
     /* Direction enable bit lives immediately after the axis enable bits
      * (one bit per axis). Matches OpenFFBoard FFBWheel / FFBJoystick. */
     directionEnableMask = static_cast<uint8_t>(1u << axis_count);
 
     blockLoad_report.effectBlockIndex = 1;
-    blockLoad_report.ramPoolAvailable =
-        static_cast<uint16_t>((FFB_MAX_EFFECTS - used_effects) * sizeof(Effect));
+    blockLoad_report.ramPoolAvailable = ramPoolAvailable();
     blockLoad_report.loadStatus = 1;
 
     pool_report.ramPoolSize            = FFB_MAX_EFFECTS * sizeof(Effect);
@@ -81,7 +104,30 @@ HidParser::HidParser(Calculator& c, uint8_t axes)
     pool_report.memoryManagement       = 1;
 }
 
-/* Enable/disable FFB. Keeps the parser's own flag and the calculator in sync. */
+/* Pool memory still free, in bytes, as the Block Load reply states it:
+ * the slots findFreeEffect() can still hand out, times the size of one. */
+uint16_t HidParser::ramPoolAvailable() const {
+    uint16_t free_slots = 0;
+    for (const Effect& e : calc.effects) {
+        if (e.type == FFB_EFFECT_NONE) ++free_slots;
+    }
+    return static_cast<uint16_t>(free_slots * sizeof(Effect));
+}
+
+/* Turn the 1-based effect block index of a report into its pool slot.
+ * Returns nullptr when the host names a block that does not exist. */
+Effect* HidParser::effectAt(uint8_t block_index, uint8_t report_id) {
+    (void)report_id;    /* only named in the log line */
+    if (block_index == 0 || block_index > FFB_MAX_EFFECTS) {
+        FFB_LOG("FFB: report 0x%02x names effect index %d (valid: 1..%d) - ignored\n",
+                report_id, block_index, FFB_MAX_EFFECTS);
+        return nullptr;
+    }
+    return &calc.effects[block_index - 1];
+}
+
+/* Enable/disable FFB. Keeps the parser's own flag and the calculator in sync
+ * (the calculator logs the change). */
 void HidParser::setActive(bool on) {
     ffb_active = on;
     calc.setActive(on);
@@ -89,6 +135,7 @@ void HidParser::setActive(bool on) {
 
 /* Set the master gain (Device Gain report 0x0D). */
 void HidParser::setGain(uint8_t g) {
+    FFB_LOG("FFB: device gain %d\n", g);
     calc.setGlobalGain(g);
 }
 
@@ -100,7 +147,7 @@ void HidParser::resetAll() {
     }
     FFB_LOG("FFB: reset all effects\n");
     reportFFBStatus.status = HID_ACTUATOR_POWER | HID_ENABLE_ACTUATORS;
-    used_effects = 1;
+    blockLoad_report.ramPoolAvailable = ramPoolAvailable();
 }
 
 /* Build the PID State input report (ID 2) from the current FFB state and push
@@ -123,19 +170,24 @@ void HidParser::sendStatusReport() {
 /* ----------- USB callback entry points ----------------------------- */
 
 /* Decode one inbound report from the host. Strips FFB_ID_OFFSET, then dispatches
- * on the report ID to the matching handler. Each handler casts the buffer
- * directly to the report's packed struct, so there is no manual byte parsing.
- * Unknown IDs (and the unsupported Custom-Force / Download-Sample reports) are
- * silently ignored, matching the original firmware. */
+ * on the report ID to the matching handler. The bytes are copied into the
+ * report's packed struct (a local, default-initialised one), so there is no
+ * manual byte parsing and no handler reads past the end of a short report: a
+ * report that is too short to hold what its handler needs is dropped. Unknown
+ * IDs (and the unsupported Custom-Force / Download-Sample reports) are ignored,
+ * matching the original firmware. */
 void HidParser::hidOut(uint8_t report_id, const uint8_t* buffer, uint16_t bufsize) {
     if (buffer == nullptr || bufsize == 0) return;
 
     uint8_t event_idx = report_id - FFB_ID_OFFSET;
 
     switch (event_idx) {
-    case HID_ID_NEWEFREP:
-        newEffect(reinterpret_cast<const FFB_CreateNewEffect_Feature_Data_t*>(buffer));
+    case HID_ID_NEWEFREP: {
+        /* Only the effect type is used; byteCount may be absent. */
+        FFB_CreateNewEffect_Feature_Data_t rep{};
+        if (readReport(rep, event_idx, buffer, bufsize, 1)) newEffect(&rep);
         break;
+    }
 
     case HID_ID_EFFREP: {
         /* Initialise to in-class defaults then overwrite with the host's
@@ -160,41 +212,59 @@ void HidParser::hidOut(uint8_t report_id, const uint8_t* buffer, uint16_t bufsiz
         }
         break;
 
-    case HID_ID_ENVREP:
-        setEnvelope(reinterpret_cast<const FFB_SetEnvelope_Data_t*>(buffer));
+    case HID_ID_ENVREP: {
+        FFB_SetEnvelope_Data_t rep{};
+        if (readReport(rep, event_idx, buffer, bufsize)) setEnvelope(&rep);
         break;
+    }
 
-    case HID_ID_CONDREP:
-        setCondition(reinterpret_cast<const FFB_SetCondition_Data_t*>(buffer));
+    case HID_ID_CONDREP: {
+        FFB_SetCondition_Data_t rep{};
+        if (readReport(rep, event_idx, buffer, bufsize)) setCondition(&rep);
         break;
+    }
 
-    case HID_ID_PRIDREP:
-        setPeriodic(reinterpret_cast<const FFB_SetPeriodic_Data_t*>(buffer));
+    case HID_ID_PRIDREP: {
+        FFB_SetPeriodic_Data_t rep{};
+        if (readReport(rep, event_idx, buffer, bufsize)) setPeriodic(&rep);
         break;
+    }
 
-    case HID_ID_CONSTREP:
-        setConstantForce(reinterpret_cast<const FFB_SetConstantForce_Data_t*>(buffer));
+    case HID_ID_CONSTREP: {
+        FFB_SetConstantForce_Data_t rep{};
+        if (readReport(rep, event_idx, buffer, bufsize)) setConstantForce(&rep);
         break;
+    }
 
-    case HID_ID_RAMPREP:
-        setRamp(reinterpret_cast<const FFB_SetRamp_Data_t*>(buffer));
+    case HID_ID_RAMPREP: {
+        FFB_SetRamp_Data_t rep{};
+        if (readReport(rep, event_idx, buffer, bufsize)) setRamp(&rep);
         break;
+    }
 
-    case HID_ID_EFOPREP:
-        setEffectOperation(reinterpret_cast<const FFB_EffOp_Data_t*>(buffer));
+    case HID_ID_EFOPREP: {
+        /* The loop count that closes the report is not used. */
+        FFB_EffOp_Data_t rep{};
+        if (readReport(rep, event_idx, buffer, bufsize, 3)) setEffectOperation(&rep);
         break;
+    }
 
     case HID_ID_BLKFRREP:
         if (bufsize >= 2) {
-            calc.freeEffect(buffer[1] - 1);
+            freeEffect(static_cast<uint16_t>(buffer[1] - 1));
         }
         break;
 
     case HID_ID_CSTMREP:
     case HID_ID_SMPLREP:
-    default:
         /* Custom force and download-sample are intentionally unsupported,
          * matching the original firmware. */
+        FFB_LOG("FFB: report 0x%02x (custom force / download sample) is not supported\n",
+                event_idx);
+        break;
+
+    default:
+        FFB_LOG("FFB: unhandled report 0x%02x (%d bytes)\n", event_idx, bufsize);
         break;
     }
 }
@@ -216,6 +286,7 @@ uint16_t HidParser::hidGet(uint8_t report_id, uint8_t* buffer, uint16_t /*reqlen
         std::memcpy(buffer, &pool_report, sizeof(pool_report));
         return sizeof(pool_report);
     default:
+        FFB_LOG("FFB: no reply for Get Report 0x%02x\n", id);
         return 0;
     }
 }
@@ -229,7 +300,8 @@ void HidParser::newEffect(const FFB_CreateNewEffect_Feature_Data_t* in_effect) {
     int32_t index = calc.findFreeEffect(in_effect->effectType);
     if (index == -1) {
         blockLoad_report.loadStatus = 2;
-        FFB_LOG("FFB: cannot allocate new effect\n");
+        FFB_LOG("FFB: cannot allocate new effect, type %d (pool full or unknown type)\n",
+                in_effect->effectType);
         return;
     }
     Effect new_effect;
@@ -239,15 +311,29 @@ void HidParser::newEffect(const FFB_CreateNewEffect_Feature_Data_t* in_effect) {
     calc.effects[index] = std::move(new_effect);
 
     blockLoad_report.effectBlockIndex = static_cast<uint8_t>(index + 1);
-    used_effects++;
-    blockLoad_report.ramPoolAvailable =
-        static_cast<uint16_t>((FFB_MAX_EFFECTS - used_effects) * sizeof(Effect));
+    blockLoad_report.ramPoolAvailable = ramPoolAvailable();
     blockLoad_report.loadStatus = 1;
+    FFB_LOG("FFB: new effect, type %d, at index %d\n",
+            in_effect->effectType, static_cast<int>(index + 1));
     sendStatusReport();
+}
+
+/* Block Free (0x0B): return one slot to the pool. An index outside the pool
+ * is ignored. */
+void HidParser::freeEffect(uint16_t id_zero_based) {
+    if (id_zero_based >= FFB_MAX_EFFECTS) {
+        FFB_LOG("FFB: block free names effect index %d (valid: 1..%d) - ignored\n",
+                static_cast<uint16_t>(id_zero_based + 1), FFB_MAX_EFFECTS);
+        return;
+    }
+    calc.freeEffect(id_zero_based);
+    blockLoad_report.ramPoolAvailable = ramPoolAvailable();
+    FFB_LOG("FFB: free effect, at index %d\n", id_zero_based + 1);
 }
 
 /* Device Control (0x0C): enable / disable / stop / reset / pause / continue. */
 void HidParser::controlCmd(uint8_t cmd) {
+    FFB_LOG("FFB: device control 0x%02x\n", cmd);
     /* Bitfield from Device Control report:
        0x01 enable, 0x02 disable, 0x04 stop, 0x08 reset,
        0x10 pause, 0x20 continue. */
@@ -264,12 +350,12 @@ void HidParser::controlCmd(uint8_t cmd) {
  * direction (per-axis angle or polar) into the axisMagnitudes[] projection
  * vector that calcComponentForce uses. */
 void HidParser::setEffect(const FFB_SetEffect_t* effect) {
-    uint8_t index = effect->effectBlockIndex;
-    if (index == 0 || index > FFB_MAX_EFFECTS) return;
-
-    Effect* p = &calc.effects[index - 1];
+    Effect* p = effectAt(effect->effectBlockIndex, HID_ID_EFFREP);
+    if (p == nullptr) return;
 
     if (p->type != effect->effectType) {
+        FFB_LOG("FFB: effect at index %d changes type %d -> %d\n",
+                effect->effectBlockIndex, p->type, effect->effectType);
         p->startTime = 0;
         p->type = effect->effectType;
         calc.setFilters(p);
@@ -347,14 +433,13 @@ void HidParser::setEffect(const FFB_SetEffect_t* effect) {
  * effect. The target axis comes from parameterBlockOffset, clamped to the
  * device's axis count. */
 void HidParser::setCondition(const FFB_SetCondition_Data_t* cond) {
-    if (cond->effectBlockIndex == 0 || cond->effectBlockIndex > FFB_MAX_EFFECTS) {
-        return;
-    }
+    Effect* p = effectAt(cond->effectBlockIndex, HID_ID_CONDREP);
+    if (p == nullptr) return;
+
     uint8_t axis = cond->parameterBlockOffset;
     if (axis >= axis_count) axis = axis_count - 1;
     if (axis >= FFB_MAX_AXIS) return;
 
-    Effect* p = &calc.effects[cond->effectBlockIndex - 1];
     p->conditions[axis].cpOffset            = cond->cpOffset;
     p->conditions[axis].negativeCoefficient = cond->negativeCoefficient;
     p->conditions[axis].positiveCoefficient = cond->positiveCoefficient;
@@ -377,11 +462,9 @@ void HidParser::setCondition(const FFB_SetCondition_Data_t* cond) {
  * every other effect first) or stop (state 3). On start it (re)builds the
  * filters and stamps startTime = now + startDelay. */
 void HidParser::setEffectOperation(const FFB_EffOp_Data_t* report) {
-    if (report->effectBlockIndex == 0 || report->effectBlockIndex > FFB_MAX_EFFECTS) {
-        return;
-    }
-    uint8_t id = report->effectBlockIndex - 1;
-    Effect& e  = calc.effects[id];
+    Effect* p = effectAt(report->effectBlockIndex, HID_ID_EFOPREP);
+    if (p == nullptr) return;
+    Effect& e = *p;
 
     if (report->state == 3) {
         e.state = 0;
@@ -396,7 +479,8 @@ void HidParser::setEffectOperation(const FFB_EffOp_Data_t* report) {
         if (e.state != 1) {
             calc.setFilters(&e);
         }
-        FFB_LOG("FFB: start effect, at index %d\n", report->effectBlockIndex);
+        FFB_LOG("FFB: start effect, at index %d (type %d, start delay %d ms)\n",
+                report->effectBlockIndex, e.type, e.startDelay);
         e.startTime = calc.millisNow() + e.startDelay;
         e.state     = 1;
     }
@@ -405,10 +489,9 @@ void HidParser::setEffectOperation(const FFB_EffOp_Data_t* report) {
 /* Set Envelope (0x02): attack/fade levels and times, and flag the effect to use
  * the envelope (applied by getEnvelopeMagnitude). */
 void HidParser::setEnvelope(const FFB_SetEnvelope_Data_t* report) {
-    if (report->effectBlockIndex == 0 || report->effectBlockIndex > FFB_MAX_EFFECTS) {
-        return;
-    }
-    Effect* p = &calc.effects[report->effectBlockIndex - 1];
+    Effect* p = effectAt(report->effectBlockIndex, HID_ID_ENVREP);
+    if (p == nullptr) return;
+
     p->attackLevel = report->attackLevel;
     p->attackTime  = report->attackTime;
     p->fadeLevel   = report->fadeLevel;
@@ -419,10 +502,9 @@ void HidParser::setEnvelope(const FFB_SetEnvelope_Data_t* report) {
 /* Set Ramp (0x06): start and end levels for a ramp effect. magnitude is forced
  * to full scale so an attached envelope has the expected range. */
 void HidParser::setRamp(const FFB_SetRamp_Data_t* report) {
-    if (report->effectBlockIndex == 0 || report->effectBlockIndex > FFB_MAX_EFFECTS) {
-        return;
-    }
-    Effect* p = &calc.effects[report->effectBlockIndex - 1];
+    Effect* p = effectAt(report->effectBlockIndex, HID_ID_RAMPREP);
+    if (p == nullptr) return;
+
     p->magnitude  = 0x7fff;  /* envelope assumes full magnitude */
     p->startLevel = report->startLevel;
     p->endLevel   = report->endLevel;
@@ -431,20 +513,18 @@ void HidParser::setRamp(const FFB_SetRamp_Data_t* report) {
 /* Set Constant Force (0x05): the signed magnitude of a constant-force effect.
  * This is the report a game streams most often while a constant force plays. */
 void HidParser::setConstantForce(const FFB_SetConstantForce_Data_t* report) {
-    if (report->effectBlockIndex == 0 || report->effectBlockIndex > FFB_MAX_EFFECTS) {
-        return;
-    }
-    Effect& e = calc.effects[report->effectBlockIndex - 1];
-    e.magnitude = report->magnitude;
+    Effect* p = effectAt(report->effectBlockIndex, HID_ID_CONSTREP);
+    if (p == nullptr) return;
+
+    p->magnitude = report->magnitude;
 }
 
 /* Set Periodic (0x04): magnitude, offset, phase and period for the periodic
  * waveforms (square/sine/triangle/sawtooth). Period is clamped to at least 1. */
 void HidParser::setPeriodic(const FFB_SetPeriodic_Data_t* report) {
-    if (report->effectBlockIndex == 0 || report->effectBlockIndex > FFB_MAX_EFFECTS) {
-        return;
-    }
-    Effect* p = &calc.effects[report->effectBlockIndex - 1];
+    Effect* p = effectAt(report->effectBlockIndex, HID_ID_PRIDREP);
+    if (p == nullptr) return;
+
     p->period    = static_cast<uint16_t>(clip_t<uint32_t>(report->period, 1, 0x7fff));
     p->magnitude = report->magnitude;
     p->offset    = report->offset;

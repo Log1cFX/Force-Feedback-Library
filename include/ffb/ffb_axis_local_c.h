@@ -63,7 +63,8 @@ typedef struct {
     uint8_t  damper_intensity;       /* 0..255 always-on damping         */
     uint8_t  friction_intensity;     /* 0..255 always-on friction        */
     uint8_t  inertia_intensity;      /* 0..255 always-on inertia         */
-    float    degrees_of_rotation;    /* full wheel travel, e.g. 900      */
+    float    degrees_of_rotation;    /* full wheel travel, e.g. 900 (same
+                                        value as for the metrics helper) */
     uint16_t damper_filter_freq;   uint8_t damper_filter_q;
     uint16_t friction_filter_freq; uint8_t friction_filter_q;
     uint16_t inertia_filter_freq;  uint8_t inertia_filter_q;
@@ -79,15 +80,17 @@ ffb_axis_local_t* ffb_axis_local_create(const ffb_axis_local_config_t* cfg);
 
 /* Compute the per-axis "feel" torque (-0x7fff..0x7fff) to ADD on top of
  * the host-requested torque from ffb_get_axis_torque(). metrics is the same
- * axis state you feed the engine; pos_degrees is the raw wheel angle;
- * ffb_on is whether host FFB is active (idle spring engages when it is not). */
+ * axis state you feed the engine (its position must not be clamped: the
+ * end-stop engages where it leaves +/-0x7fff); ffb_on is whether host FFB is
+ * active (idle spring engages when it is not). pos_degrees is accepted for
+ * source compatibility and not used. */
 int32_t ffb_axis_local_compute(ffb_axis_local_t* a, const ffb_axis_state_t* metrics,
                                float pos_degrees, bool ffb_on);
 
 /* Rebuild filter coefficients for a new control-loop rate. */
 void ffb_axis_local_set_samplerate(ffb_axis_local_t* a, float hz);
 
-/* Retune the idle-spring strength at runtime (handles the cached scale). */
+/* Retune the idle-spring strength at runtime; applies on the next compute. */
 void ffb_axis_local_set_idle_spring(ffb_axis_local_t* a, uint8_t strength);
 
 /* Retune the live intensities (damper/friction/inertia/endstop). These are

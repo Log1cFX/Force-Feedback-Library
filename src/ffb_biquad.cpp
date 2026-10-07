@@ -30,9 +30,9 @@
 /*
  * ffb_biquad.cpp
  *
- * Ported verbatim from OpenFFBoard Filters.cpp. The only change is that
- * clip<float,float>(...) was inlined as a local helper to drop the
- * cppmain.h dependency.
+ * Ported from OpenFFBoard Filters.cpp. clip<float,float>(...) was inlined
+ * as a local helper to drop the cppmain.h dependency, and the low-pass has
+ * an explicit pass-through case for a cutoff at Nyquist (see calcBiquad).
  */
 
 #include "ffb/ffb_biquad.h"
@@ -46,8 +46,8 @@
 namespace {
 
 /* Inlined replacement for OpenFFBoard's clip<float>(): clamp the normalised
- * cutoff to [0, 0.5]. A biquad's normalised frequency (f / samplerate) must
- * stay below Nyquist (0.5) or the filter becomes unstable. */
+ * cutoff to [0, 0.5]. A biquad's normalised frequency (f / samplerate) cannot
+ * go past Nyquist (0.5). */
 inline float clip01(float v) {
     if (v < 0.0f)  return 0.0f;
     if (v > 0.5f)  return 0.5f;
@@ -124,6 +124,14 @@ void Biquad::calcBiquad() {
     float K = std::tan(static_cast<float>(M_PI) * Fc);
     switch (this->type) {
         case BiquadType::lowpass:
+            if (Fc >= 0.5f) {
+                /* A cutoff at Nyquist removes nothing, and K = tan(pi/2)
+                 * has no finite value there (the formulas below would put
+                 * both poles on the unit circle). Pass the input through. */
+                a0 = 1.0f;
+                a1 = a2 = b1 = b2 = 0.0f;
+                break;
+            }
             norm = 1 / (1 + K / Q + K * K);
             a0 = K * K * norm;
             a1 = 2 * a0;

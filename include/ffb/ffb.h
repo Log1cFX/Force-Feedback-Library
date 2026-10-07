@@ -32,6 +32,10 @@
  *
  * Public facade for the standalone OpenFFBoard-derived FFB library.
  *
+ * Compile-time options (FFB_MAX_AXIS, FFB_MAX_EFFECTS, ...) are read from
+ * ffb_config.h, a header you keep in your own project - see the template
+ * in examples/ffb_config.h.
+ *
  * Typical usage (bare-metal, no RTOS):
  *
  *   #include "ffb/ffb.h"
@@ -67,9 +71,9 @@
 #include <cstdint>
 
 #include "ffb/ffb_calculator.h"
-#include "ffb/ffb_config.h"
 #include "ffb/ffb_defs.h"
 #include "ffb/ffb_descriptor.h"
+#include "ffb/ffb_options.h"
 #include "ffb/ffb_parser.h"
 
 namespace ffb {
@@ -80,12 +84,18 @@ namespace ffb {
  * integrators ever touch. */
 class Library {
 public:
-    /* axis_count must be <= FFB_MAX_AXIS; ts supplies the millis()/micros()
-     * counters the engine needs for effect timing. The parser is wired to a
-     * reference of the calculator so the two share one effect pool. Allocates
-     * nothing on the heap. */
+    /* axis_count is 1..FFB_MAX_AXIS (anything else is clamped into that
+     * range); ts supplies the millis()/micros() counters the engine needs for
+     * effect timing. The parser is wired to a reference of the calculator so
+     * the two share one effect pool. Allocates nothing on the heap. */
     Library(uint8_t axis_count, TimeSource ts)
         : calculator(axis_count, ts), parser(calculator, axis_count) {}
+
+    /* Not copyable: the parser holds a reference to this object's own
+     * calculator, so a copy would decode reports into the original's effect
+     * pool. Keep one instance and pass it around by reference or pointer. */
+    Library(const Library&) = delete;
+    Library& operator=(const Library&) = delete;
 
     /* ------- USB receive (call from your USB stack callbacks) ------ */
     void hidOut(uint8_t report_id, const uint8_t* buf, uint16_t len) {

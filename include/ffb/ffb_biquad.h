@@ -30,12 +30,13 @@
 /*
  * ffb_biquad.h
  *
- * Direct-form-I biquad filter. Math copied verbatim from
+ * Biquad filter in transposed direct form II. Math copied verbatim from
  * https://www.earlevel.com/main/2012/11/26/biquad-c-source-code/
  *
- * Ported from OpenFFBoard's Filters.h/cpp with the only change being
- * an inline clamp helper (was clip<>() in cppmain.h) so the file has
- * no project-specific dependencies.
+ * Ported from OpenFFBoard's Filters.h/cpp. The changes are an inline clamp
+ * helper (was clip<>() in cppmain.h) so the file has no project-specific
+ * dependencies, and a low-pass whose cutoff sits at Nyquist passing its
+ * input through instead of evaluating tan(pi/2).
  */
 
 #ifndef FFB_BIQUAD_H_
@@ -50,6 +51,18 @@ struct biquad_constant_t {
     uint16_t freq;
     uint8_t  q;
 };
+
+/* The two values a {freq, q} preset stands for, safe to hand to
+ * Biquad::setBiquad(). A zero in either field would make the coefficient
+ * math divide by zero, so it is read the way OpenFFBoard's
+ * checkFilterCoeff() reads it: freq 0 means "no cutoff" (Nyquist, where a
+ * low-pass passes everything) and q 0 means the lowest q, 1. */
+inline float presetFc(const biquad_constant_t& c, float samplerate_hz) {
+    return c.freq != 0 ? c.freq / samplerate_hz : 0.5f;
+}
+inline uint8_t presetQ(const biquad_constant_t& c) {
+    return c.q != 0 ? c.q : 1;
+}
 
 enum class BiquadType : uint8_t {
     lowpass = 0,
@@ -68,7 +81,7 @@ public:
 
     float process(float in);     /* filter one sample; call once per tick        */
     void  setBiquad(BiquadType type, float Fc, float Q, float peakGain); /* configure + build coeffs */
-    void  setFc(float Fc);       /* Fc is normalised: f / samplerate, must be < 0.5 */
+    void  setFc(float Fc);       /* Fc is normalised: f / samplerate, clamped to 0..0.5 */
     float getFc() const;
     void  setQ(float Q);
     float getQ() const;
@@ -78,7 +91,7 @@ protected:
     BiquadType type = BiquadType::lowpass;
     float a0 = 0, a1 = 0, a2 = 0;  /* feed-forward (numerator) coefficients     */
     float b1 = 0, b2 = 0;          /* feedback (denominator) coefficients        */
-    float Fc = 0;                  /* normalised cutoff, f / samplerate (< 0.5)  */
+    float Fc = 0;                  /* normalised cutoff, f / samplerate (<= 0.5) */
     float Q  = 0;                  /* quality factor                             */
     float peakGain = 0;            /* peak/shelf gain in dB (lowpass ignores it) */
     float z1 = 0, z2 = 0;          /* two-sample delay line (filter state)       */

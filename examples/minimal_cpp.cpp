@@ -35,6 +35,11 @@
  * micros(), and USB stack. The library doesn't care which USB stack
  * you use - TinyUSB, ST USB Device, LUFA, anything that can deliver
  * HID Set/Get Report bytes will work.
+ *
+ * The compile-time options (FFB_MAX_AXIS, FFB_MAX_EFFECTS, ...) come from
+ * ffb_config.h, which lives in YOUR project rather than in the library.
+ * This example is built against the template next to it
+ * (examples/ffb_config.h) - copy that file into your own tree.
  */
 
 #include "ffb/ffb.h"
@@ -52,7 +57,9 @@ static uint32_t platform_millis() {
 
 static uint32_t platform_micros() {
     /* Replace with the platform's high-res timer. The library only uses
-       deltas, so wrap-around is fine. */
+       deltas, so wrap-around is fine. Use the same clock as millis()
+       (micros() / 1000 == millis()); a timer that runs apart from it is
+       ignored and effects are timed in whole milliseconds. */
     return platform_millis() * 1000;
 }
 
@@ -80,6 +87,10 @@ extern "C" uint16_t on_hid_get_report(uint8_t report_id,
 
 /* ---- Application main --------------------------------------------- */
 int main() {
+    /* FFB_MAX_AXIS and FFB_MAX_EFFECTS are set in your ffb_config.h. */
+    std::printf("ffb_config.h: FFB_MAX_AXIS=%d, FFB_MAX_EFFECTS=%d\n",
+                FFB_MAX_AXIS, FFB_MAX_EFFECTS);
+
     ffb::TimeSource ts;
     ts.millis = platform_millis;
     ts.micros = platform_micros;

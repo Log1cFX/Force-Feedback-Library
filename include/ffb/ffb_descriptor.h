@@ -52,8 +52,8 @@
 
 #include <cstdint>
 
-#include "ffb/ffb_config.h"
 #include "ffb/ffb_defs.h"
+#include "ffb/ffb_options.h"
 
 namespace ffb {
 

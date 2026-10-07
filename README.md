@@ -11,6 +11,8 @@ removed so the library drops into any bare-metal microcontroller project.
 - **No heap** — the effect pool and all filters live inside the `Library` object.
 - **No RTOS** — a plain polled engine; you call it once per control tick.
 - **No dependencies** — just C++11, with a plain-C wrapper for C projects.
+- **Single-precision math** — everything is computed in `float`, so the engine
+  stays on the FPU of a Cortex-M4F-class MCU and links no double-precision code.
 - **USB-stack / motor / encoder agnostic** — you wire those up.
 
 > **Full guide:** see **[DOCUMENTATION.md](DOCUMENTATION.md)**. Part I is a
@@ -33,6 +35,11 @@ are yours to wire up.
 
 The whole contract: feed it the host's USB reports and the wheel state, read back
 a torque.
+
+One thing to do before the first build: copy
+[`examples/ffb_config.h`](examples/ffb_config.h) into your own project and put
+its folder on the include path. The library reads its
+[compile-time options](#compile-time-configuration) from that file.
 
 ```cpp
 #include "ffb/ffb.h"
@@ -81,13 +88,18 @@ int32_t torque = ffb_get_axis_torque(lib, 0);
 See [DOCUMENTATION.md](DOCUMENTATION.md) for the units, the per-step breakdown,
 and TinyUSB wiring.
 
+The engine covers the force-feedback half of the device. The other half — the
+joystick input report that tells the host where the wheel is (report ID 1 in the
+shipped descriptor: 64 buttons and eight 16-bit axes) — is sent by your own
+code; DOCUMENTATION.md §6.1 shows its layout.
+
 ## Library layout
 
 ```
 include/ffb/
 ├── ffb.h              Main facade (the only header most users need)
 ├── ffb_c.h            Plain-C wrapper
-├── ffb_config.h       Compile-time knobs (FFB_MAX_AXIS, FFB_MAX_EFFECTS, …)
+├── ffb_options.h      Reads your ffb_config.h and fills in defaults (internal)
 ├── ffb_descriptor.h   Pre-built HID descriptor + assembly macros
 ├── ffb_calculator.h   The math engine (advanced)
 ├── ffb_parser.h       The USB report decoder (advanced)
@@ -99,6 +111,7 @@ include/ffb/
 └── ffb_axis_local_c.h Optional: C wrapper for ffb_axis_local.h
 src/                   Implementations
 examples/
+├── ffb_config.h              Template for the config header you supply
 ├── minimal_cpp.cpp           Smallest C++ integration
 ├── minimal_c.c               Same, using the C API
 ├── c_wrappers.c              C API + metrics/axis-local helpers + tuning
@@ -111,16 +124,27 @@ DOCUMENTATION.md
 
 ## Compile-time configuration
 
-Override these before including any `ffb/*` header, or on the compiler command
-line (`-DFFB_MAX_AXIS=1`):
+The options below are not set inside the library. They live in **`ffb_config.h`,
+a header you create in your own project**, outside the library folder — the same
+arrangement as TinyUSB's `tusb_config.h`:
+
+1. Copy [`examples/ffb_config.h`](examples/ffb_config.h) into your project.
+2. Edit the values.
+3. Put its folder on the include path of everything that uses the library, the
+   library's own sources included (with the bundled CMake:
+   `-DFFB_CONFIG_DIR=<folder>`).
 
 | Macro | Default | Purpose |
 |---|---|---|
 | `FFB_MAX_AXIS` | `2` | Number of physical axes (1, 2, or 3) |
-| `FFB_MAX_EFFECTS` | `40` | Effect-slot pool size |
+| `FFB_MAX_EFFECTS` | `40` | Effect-slot pool size (1 to 127) |
 | `FFB_DEFAULT_SAMPLERATE_HZ` | `1000.0f` | Initial calculation rate |
 | `FFB_ID_OFFSET` | `0` | Added to every report ID (for composite HID stacks) |
-| `FFB_LOG(msg)` | no-op | Hook for debug logging |
+| `FFB_LOG(...)` | no-op | `printf`-style hook for debug logging |
+
+Anything the file leaves out keeps its default. Because the library and your
+code read the same file, they always agree on these values, and updating the
+library never overwrites your settings.
 
 ## Platform requirements
 
@@ -132,11 +156,14 @@ uint32_t micros(void);  // microseconds since boot
 ```
 
 Both may wrap around — the library only uses deltas. If your MCU has only
-`millis()`, derive `micros()` from any hardware timer.
+`millis()`, derive `micros()` from any hardware timer. The two should be the
+same clock (`micros() / 1000 == millis()`): `micros()` supplies the fraction of
+the current millisecond. Where it is missing or runs apart from `millis()`,
+effects are timed in whole milliseconds instead.
 
 No heap is used at runtime: the effect pool and biquad filters are allocated
 statically inside the `Library`. With defaults (`FFB_MAX_EFFECTS=40`,
-`FFB_MAX_AXIS=2`) the footprint is about **9 KB** of BSS.
+`FFB_MAX_AXIS=2`) the footprint is about **6.7 KB** of BSS.
 
 ## Building
 
@@ -146,8 +173,13 @@ cmake --build build        # produces libffb.a
 ```
 
 Options: `-DFFB_BUILD_EXAMPLES=ON`, `-DFFB_BUILD_TESTS=ON`,
-`-DFFB_BUILD_C_WRAPPER=ON` (on by default). Or just add the `src/*.cpp` files to
-your existing build and put `include/` on the include path — compile
+`-DFFB_BUILD_C_WRAPPER=ON` (on by default), and `-DFFB_CONFIG_DIR=<folder>` — the
+folder holding your `ffb_config.h`. Built on its own as above, the library uses
+the template in `examples/`; added to your project with `add_subdirectory()`,
+`FFB_CONFIG_DIR` must be set.
+
+Or just add the `src/*.cpp` files to your existing build and put `include/` and
+the folder holding your `ffb_config.h` on the include path — compile
 `ffb_metrics*.cpp` / `ffb_axis_local*.cpp` only if you use those helpers.
 
 ## Optional helpers
@@ -199,7 +231,9 @@ All standard DirectInput PID effects:
 | Conditions | Single or per-axis condition parameter blocks |
 
 The math is a faithful port of OpenFFBoard's `EffectsCalculator.cpp` and produces
-the same forces.
+the same forces. It runs in single precision from end to end, a deliberate
+choice for speed: where the firmware lets a term promote to `double`, a sample
+here can land one rounding step away (a count or so in 32767).
 
 ## Testing
 This library has been tested on one of my own projects to make an FFB steering 

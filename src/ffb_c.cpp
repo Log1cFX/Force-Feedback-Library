@@ -76,6 +76,7 @@ ffb_lib_t* ffb_create(uint8_t axis_count,
                       ffb_time_fn_t millis_fn,
                       ffb_time_fn_t micros_fn) {
     if (g_created) {
+        FFB_LOG("FFB: ffb_create called again - returning the existing instance\n");
         return reinterpret_cast<ffb_lib_t*>(g_lib_ptr);
     }
     ffb::TimeSource ts{};

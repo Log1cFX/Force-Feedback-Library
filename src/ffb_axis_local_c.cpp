@@ -85,6 +85,7 @@ void ffb_axis_local_config_default(ffb_axis_local_config_t* out) {
  * the defaults. Returns NULL once all FFB_MAX_AXIS slots are in use. */
 ffb_axis_local_t* ffb_axis_local_create(const ffb_axis_local_config_t* cfg) {
     if (g_count >= FFB_MAX_AXIS) {
+        FFB_LOG("FFB: ffb_axis_local_create - all %d slots are in use\n", FFB_MAX_AXIS);
         return nullptr;   /* pool full - one unit per axis */
     }
     ffb::AxisLocalConfig c;   /* starts at C++ defaults */
@@ -107,7 +108,8 @@ ffb_axis_local_t* ffb_axis_local_create(const ffb_axis_local_config_t* cfg) {
 }
 
 /* Compute the axis-local "feel" torque to ADD on top of the host torque.
- * Unpacks the C axis state, then forwards to AxisLocalEffects::compute(). */
+ * Unpacks the C axis state, then forwards to AxisLocalEffects::compute()
+ * (which no longer reads pos_degrees). */
 int32_t ffb_axis_local_compute(ffb_axis_local_t* a, const ffb_axis_state_t* metrics,
                                float pos_degrees, bool ffb_on) {
     if (!a || !metrics) return 0;
@@ -124,8 +126,8 @@ void ffb_axis_local_set_samplerate(ffb_axis_local_t* a, float hz) {
     as_a(a)->setSamplerate(hz);
 }
 
-/* Retune the idle spring. Needs its own setter (not just a config write)
- * because the derived scale/clip values are cached and must be recomputed. */
+/* Retune the idle spring. C has no access to config(), so this setter is the
+ * way to change the strength after creation. */
 void ffb_axis_local_set_idle_spring(ffb_axis_local_t* a, uint8_t strength) {
     if (!a) return;
     as_a(a)->setIdleSpringStrength(strength);

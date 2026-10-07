@@ -63,17 +63,22 @@ MetricsBuilder::MetricsBuilder(float degrees, float hz, MetricsFilterPreset p)
 void MetricsBuilder::setSamplerate(float hz) {
     if (hz <= 0.0f) hz = FFB_DEFAULT_SAMPLERATE_HZ;
     samplerate = hz;
+    /* presetFc()/presetQ() keep a zero freq or q from reaching the
+     * coefficient math (see ffb_biquad.h). */
     speed_filter.setBiquad(BiquadType::lowpass,
-                            preset.speed.freq / samplerate,
-                            preset.speed.q / 100.0f, 0.0f);
+                            presetFc(preset.speed, samplerate),
+                            presetQ(preset.speed) / 100.0f, 0.0f);
     accel_filter.setBiquad(BiquadType::lowpass,
-                            preset.accel.freq / samplerate,
-                            preset.accel.q / 100.0f, 0.0f);
+                            presetFc(preset.accel, samplerate),
+                            presetQ(preset.accel) / 100.0f, 0.0f);
 }
 
+/* Restart the history at a known position: speed and acceleration read zero
+ * until the wheel actually moves from there. */
 void MetricsBuilder::reset(float pos_degrees) {
     last_pos = pos_degrees;
     last_speed_raw = 0;
+    has_last_pos = true;
     /* Reinit filters to clear state. */
     speed_filter.calcBiquad();
     accel_filter.calcBiquad();
@@ -98,6 +103,15 @@ int32_t MetricsBuilder::scalePos(float pos_degrees) const {
  * rate; both are low-pass filtered to tame the noise of differentiating an
  * encoder. */
 AxisState MetricsBuilder::update(float new_pos_degrees) {
+    /* The very first sample has no predecessor to difference against. Treat
+     * it as the starting point (OpenFFBoard seeds its metrics with the real
+     * angle too) instead of as a jump from 0 degrees, which would read as a
+     * huge speed for the first few ticks. */
+    if (!has_last_pos) {
+        last_pos = new_pos_degrees;
+        has_last_pos = true;
+    }
+
     AxisState out;
     out.pos_scaled_16b = scalePos(new_pos_degrees);
 

@@ -39,8 +39,10 @@
  *     FFB pipeline; users build their own input report)
  *   - FFB_Effect struct moved to ffb_effect.h (depends on Biquad)
  *
- * All wire structures keep their __attribute__((packed)) layout so the
- * USB host's bytes can be cast directly into them.
+ * All wire structures keep their packed layout so the USB host's bytes map
+ * straight onto them. GCC and Clang get __attribute__((packed)) on each
+ * struct; other compilers get #pragma pack(1) around the block. The
+ * static_asserts after the structs make a build fail if neither took effect.
  */
 
 #ifndef FFB_DEFS_H_
@@ -48,13 +50,14 @@
 
 #include <cstdint>
 
-#include "ffb/ffb_config.h"
+#include "ffb/ffb_options.h"
 
 #ifndef FFB_PACKED
 #  if defined(__GNUC__)
 #    define FFB_PACKED __attribute__((packed))
 #  else
 #    define FFB_PACKED
+#    define FFB_PRAGMA_PACK 1
 #  endif
 #endif
 
@@ -117,6 +120,10 @@ constexpr uint8_t HID_EFFECT_PLAYING    = 0x10;
 constexpr uint16_t FFB_EFFECT_DURATION_INFINITE = 0xFFFF;
 
 /* --------- Wire reports ---------------------------------------------- */
+
+#ifdef FFB_PRAGMA_PACK
+#  pragma pack(push, 1)
+#endif
 
 /* PID State input report (device -> host) */
 struct FFB_PACKED reportFFB_status_t {
@@ -218,6 +225,26 @@ struct FFB_PACKED FFB_SetConstantForce_Data_t {
     uint8_t  effectBlockIndex = 0;
     int16_t  magnitude        = 0;
 };
+
+#ifdef FFB_PRAGMA_PACK
+#  pragma pack(pop)
+#endif
+
+/* Each struct must match its report's layout byte for byte (the OUT reports
+ * include their leading report-ID byte; the 2-axis Set Effect report carries
+ * 4 more bytes after the part mirrored here). A size that is off means the
+ * compiler padded the struct: define FFB_PACKED for it. */
+static_assert(sizeof(reportFFB_status_t)                 ==  2, "PID State layout is 2 bytes");
+static_assert(sizeof(FFB_SetEffect_t)                    == 18, "Set Effect layout is 18 bytes");
+static_assert(sizeof(FFB_SetEnvelope_Data_t)             == 14, "Set Envelope layout is 14 bytes");
+static_assert(sizeof(FFB_SetCondition_Data_t)            == 15, "Set Condition layout is 15 bytes");
+static_assert(sizeof(FFB_SetPeriodic_Data_t)             == 12, "Set Periodic layout is 12 bytes");
+static_assert(sizeof(FFB_SetConstantForce_Data_t)        ==  4, "Set Constant Force layout is 4 bytes");
+static_assert(sizeof(FFB_SetRamp_Data_t)                 ==  6, "Set Ramp layout is 6 bytes");
+static_assert(sizeof(FFB_EffOp_Data_t)                   ==  4, "Effect Operation layout is 4 bytes");
+static_assert(sizeof(FFB_CreateNewEffect_Feature_Data_t) ==  3, "Create New Effect layout is 3 bytes");
+static_assert(sizeof(FFB_BlockLoad_Feature_Data_t)       ==  4, "Block Load layout is 4 bytes");
+static_assert(sizeof(FFB_PIDPool_Feature_Data_t)         ==  4, "PID Pool layout is 4 bytes");
 
 /* Per-axis condition parameter block (used inside Effect, not on the wire). */
 struct FFB_Effect_Condition {

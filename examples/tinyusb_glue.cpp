@@ -37,6 +37,9 @@
  *
  * The HID descriptor returned by ffb::Library::descriptor1Axis() must
  * be returned from tud_hid_descriptor_report_cb().
+ *
+ * The project also needs its own ffb_config.h - copy examples/ffb_config.h
+ * and keep it next to your tusb_config.h.
  */
 
 #include "ffb/ffb.h"

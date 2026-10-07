@@ -33,13 +33,18 @@
  * Computes per-axis FFB torque every tick. Ported from
  * OpenFFBoard EffectsCalculator. The math (calcNonConditionEffectForce,
  * calcComponentForce, calcConditionEffectForce, getEnvelopeMagnitude,
- * setFilters) is bit-identical to the original; the differences are:
+ * setFilters) follows the original formula for formula; the differences are:
  *
  *   - Inheritance from Thread / PersistentStorage / CommandHandler removed.
  *   - The `axes` vector parameter is replaced by an internal AxisState
  *     buffer (filled via setAxisState) and a torque output buffer (read
  *     via getAxisTorque).
- *   - HAL_GetTick()/micros() replaced by the user-supplied TimeSource.
+ *   - HAL_GetTick()/micros() replaced by the user-supplied TimeSource. Both
+ *     clocks are sampled once per tick and every effect is timed by unsigned
+ *     differences from its own start, so a counter wrapping (or a long
+ *     uptime) never disturbs a waveform.
+ *   - All arithmetic is single precision, so the engine never leaves the
+ *     FPU of a Cortex-M4F class MCU and pulls in no double-precision code.
  *   - Persistent flash storage stripped (filter coefficients are runtime
  *     defaults that match the original firmware's defaults).
  *   - Statistics, monitor thread, command interface removed.
@@ -52,15 +57,16 @@
 #include <cstdint>
 
 #include "ffb/ffb_biquad.h"
-#include "ffb/ffb_config.h"
 #include "ffb/ffb_defs.h"
 #include "ffb/ffb_effect.h"
+#include "ffb/ffb_options.h"
 
 namespace ffb {
 
 /* Per-axis kinematic state, filled by the user before calling calculate(). */
 struct AxisState {
-    int32_t pos_scaled_16b;  /* -0x7fff .. 0x7fff */
+    int32_t pos_scaled_16b;  /* -0x7fff .. 0x7fff over the travel; beyond
+                                that past a limit (the end-stop needs it) */
     float   speed;            /* deg/s             */
     float   accel;            /* deg/s^2           */
     AxisState() : pos_scaled_16b(0), speed(0), accel(0) {}
@@ -68,7 +74,12 @@ struct AxisState {
         : pos_scaled_16b(p), speed(s), accel(a) {}
 };
 
-/* User-supplied time source (millisecond + microsecond counters). */
+/* User-supplied time source: two free-running 32-bit counters, milliseconds
+ * and microseconds, that are allowed to wrap. They should be two views of
+ * the same clock (micros() / 1000 == millis()); micros() then gives the
+ * periodic and ramp effects their sub-millisecond resolution. If it is
+ * missing, or does not track millis(), effects are timed in whole
+ * milliseconds instead. */
 struct TimeSource {
     uint32_t (*millis)();
     uint32_t (*micros)();
@@ -106,6 +117,7 @@ struct EffectFilterPreset {
  * from OpenFFBoard's EffectsCalculator, minus the RTOS / flash / CLI machinery. */
 class Calculator {
 public:
+    /* axis_count outside 1..FFB_MAX_AXIS is clamped into that range. */
     Calculator(uint8_t axis_count, TimeSource ts);
 
     static constexpr uint32_t INTERNAL_SCALER_DAMPER   = 40;
@@ -133,7 +145,7 @@ public:
 
     /* Control. */
     bool isActive() const { return effects_active; }
-    void setActive(bool a) { effects_active = a; }
+    void setActive(bool a);
 
     /* Settings (match the configurator's runtime-settable knobs). */
     void    setGlobalGain(uint8_t g) { global_gain = g; }
@@ -143,7 +155,7 @@ public:
     float getSamplerate() const { return calcfrequency; }
 
     /* Time-source pass-through for the parser (which needs to stamp
-     * effect start times in millis). */
+     * effect start times in millis). A missing clock reads as 0. */
     uint32_t millisNow() const { return time_source.millis ? time_source.millis() : 0; }
     uint32_t microsNow() const { return time_source.micros ? time_source.micros() : 0; }
 
@@ -166,17 +178,30 @@ public:
     void updateFiltersForType(uint8_t effect_type);
 
 private:
-    /* Math — copied verbatim from EffectsCalculator.cpp. */
-    int32_t calcNonConditionEffectForce(Effect* effect);
+    /* "Now" as one calculate() call sees it. The clocks are read once per
+     * tick, so every effect is timed against the same instant. */
+    struct TickTime {
+        uint32_t ms;       /* millisecond counter                           */
+        uint32_t sub_us;   /* microseconds past that millisecond            */
+        float    sub_ms;   /* the same, in milliseconds                     */
+    };
+    TickTime sampleClocks();
+
+    /* Math — ported from EffectsCalculator.cpp. elapsed_ms is the time since
+     * the effect's startTime. */
+    int32_t calcNonConditionEffectForce(Effect* effect, uint32_t elapsed_ms,
+                                        const TickTime& now);
     int32_t calcComponentForce(Effect* effect, int32_t forceVector, uint8_t axis);
     int32_t calcConditionEffectForce(Effect* effect, float metric,
                                      uint8_t gain_val, uint8_t idx,
                                      float scale, float angle_ratio);
-    int32_t getEnvelopeMagnitude(Effect* effect);
+    int32_t getEnvelopeMagnitude(Effect* effect, uint32_t elapsed_ms);
     float   speedRampupPct() const;
 
     /* Configuration. */
     uint8_t      axis_count;
+    bool         axis_count_clamped;        /* constructor had to correct it */
+    bool         clock_mismatch_logged = false;
     TimeSource   time_source;
     bool         effects_active = false;
     uint8_t      global_gain    = 0xff;

@@ -62,6 +62,7 @@ inline ffb::MetricsBuilder* as_m(ffb_metrics_t* h) {
  * pool slot (or fail if the pool is exhausted) and placement-new into it. */
 ffb_metrics_t* make(float degrees, float hz, ffb::MetricsFilterPreset preset) {
     if (g_count >= FFB_MAX_AXIS) {
+        FFB_LOG("FFB: ffb_metrics_create - all %d slots are in use\n", FFB_MAX_AXIS);
         return nullptr;   /* pool full - one builder per axis */
     }
     void* slot = g_storage[g_count++];
@@ -116,7 +117,8 @@ void ffb_metrics_set_samplerate(ffb_metrics_t* m, float hz) {
 }
 
 /* Re-seed history at a known position (clears speed/accel so the next update
- * doesn't see a huge bogus jump). */
+ * doesn't see a huge bogus jump). Not needed at start-up: the first update
+ * seeds itself. Use it when the position jumps, e.g. after re-centering. */
 void ffb_metrics_reset(ffb_metrics_t* m, float pos_degrees) {
     if (!m) return;
     as_m(m)->reset(pos_degrees);

@@ -32,6 +32,10 @@
  *
  * Same as minimal_cpp.cpp but using the C API. The library can be
  * driven entirely from C code; the C++ internals are hidden.
+ *
+ * A C project still needs an ffb_config.h of its own (see the template in
+ * examples/ffb_config.h): the library sources read their compile-time
+ * options from it.
  */
 
 #include "ffb/ffb_c.h"

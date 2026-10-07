@@ -28,17 +28,30 @@
  */
 
 /*
- * ffb_config.h
+ * ffb_options.h
  *
- * Compile-time configuration for the standalone FFB library.
+ * Resolves the compile-time options of the standalone FFB library.
  *
- * Users may override any of these by defining them on the compiler
- * command line (-DFFB_MAX_AXIS=1) or in a project-wide header included
- * before any ffb header.
+ * The options are not set here. They come from ffb_config.h, a header
+ * that belongs to YOUR project and lives outside the library (start from
+ * the template in examples/ffb_config.h). Its directory must be on the
+ * include path of every source file that uses the library - the library's
+ * own sources included - so that both sides are built with the same
+ * values.
+ *
+ * This header pulls that file in, gives every option it leaves undefined
+ * its default, and rejects values the library cannot work with.
  */
 
-#ifndef FFB_CONFIG_H_
-#define FFB_CONFIG_H_
+#ifndef FFB_OPTIONS_H_
+#define FFB_OPTIONS_H_
+
+#if defined(__has_include)
+#  if !__has_include("ffb_config.h")
+#    error "ffb_config.h not found - copy examples/ffb_config.h into your project and add its directory to the include path"
+#  endif
+#endif
+#include "ffb_config.h"
 
 /* Number of physical axes the device exposes. Must be 1, 2, or 3. */
 #ifndef FFB_MAX_AXIS
@@ -55,6 +68,12 @@
 #define FFB_MAX_EFFECTS 40
 #endif
 
+/* The HID report descriptor declares the pool size as a one-byte signed
+ * logical maximum, so anything above 127 would describe an invalid device. */
+#if FFB_MAX_EFFECTS < 1 || FFB_MAX_EFFECTS > 127
+#error "FFB_MAX_EFFECTS must be between 1 and 127"
+#endif
+
 /* Default effect-calculation rate, in Hz. Used to initialise biquad
  * filter coefficients before the user calls setSamplerate(). */
 #ifndef FFB_DEFAULT_SAMPLERATE_HZ
@@ -68,10 +87,11 @@
 #define FFB_ID_OFFSET 0
 #endif
 
-/* Optional debug log hook. Define this to your own logging function
- * before including any ffb header to capture effect lifecycle events. */
+/* Optional printf-style debug log hook. A no-op unless ffb_config.h
+ * routes it to a logging function to capture effect lifecycle events and
+ * anything the library has to correct or refuse. */
 #ifndef FFB_LOG
 #define FFB_LOG(...) ((void)0)
 #endif
 
-#endif /* FFB_CONFIG_H_ */
+#endif /* FFB_OPTIONS_H_ */

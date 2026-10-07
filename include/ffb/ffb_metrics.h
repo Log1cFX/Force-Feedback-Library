@@ -66,7 +66,10 @@ public:
                    MetricsFilterPreset preset = MetricsFilterPreset{});
 
     /* Push a new raw position (in degrees) and return the resulting
-     * AxisState that you can feed straight into Library::setAxisState(). */
+     * AxisState that you can feed straight into Library::setAxisState().
+     * The first position seen (after construction or reset()) only seeds
+     * the history, so the wheel may sit anywhere at power-up without
+     * producing a speed spike. */
     AxisState update(float new_pos_degrees);
 
     /* Re-derive filter coefficients (call after changing the FFB rate). */
@@ -84,6 +87,7 @@ private:
     float samplerate;
     float last_pos = 0;
     float last_speed_raw = 0;
+    bool  has_last_pos = false;   /* false until a first position is known */
     Biquad speed_filter;
     Biquad accel_filter;
     MetricsFilterPreset preset;

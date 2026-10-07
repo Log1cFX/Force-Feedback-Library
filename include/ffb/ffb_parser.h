@@ -40,6 +40,8 @@
  *     from their USB stack callbacks.
  *   - tud_hid_report() replaced by a user-supplied SendReportFn callback.
  *   - logSerialDebug() replaced by the FFB_LOG macro (no-op by default).
+ *   - A report too short for its handler is dropped instead of being read
+ *     past its end.
  */
 
 #ifndef FFB_PARSER_H_
@@ -48,8 +50,8 @@
 #include <cstdint>
 
 #include "ffb/ffb_calculator.h"
-#include "ffb/ffb_config.h"
 #include "ffb/ffb_defs.h"
+#include "ffb/ffb_options.h"
 
 namespace ffb {
 
@@ -71,13 +73,20 @@ using SendReportFn = bool (*)(const uint8_t* report, uint16_t len);
 class HidParser {
 public:
     /* The parser is given a reference to the Calculator that owns the
-     * effects array, plus the number of axes the device exposes. */
+     * effects array, plus the number of axes the device exposes (clamped
+     * to 1..FFB_MAX_AXIS). */
     HidParser(Calculator& calc, uint8_t axis_count);
+
+    /* Bound to one Calculator for life, so there is nothing sensible a
+     * copy could mean. */
+    HidParser(const HidParser&) = delete;
+    HidParser& operator=(const HidParser&) = delete;
 
     /* Inbound USB data. Call from your USB stack's Set Report callback
      * (handles both interrupt-OUT and SET_REPORT on the control endpoint).
      * Pass the report ID as the host sent it; the library subtracts
-     * FFB_ID_OFFSET internally. */
+     * FFB_ID_OFFSET internally. bufsize must be the number of valid bytes
+     * in buffer: a report shorter than its layout is ignored. */
     void hidOut(uint8_t report_id, const uint8_t* buffer, uint16_t bufsize);
 
     /* Outbound USB feature reply. Call from your USB stack's Get Report
@@ -120,10 +129,15 @@ private:
     void setPeriodic(const FFB_SetPeriodic_Data_t* report);
     void setEffectOperation(const FFB_EffOp_Data_t* report);
 
+    /* Pool slot for a report's 1-based effect block index (nullptr if the
+     * index is out of range), and the free pool space the Block Load
+     * reply reports. */
+    Effect*  effectAt(uint8_t block_index, uint8_t report_id);
+    uint16_t ramPoolAvailable() const;
+
     Calculator& calc;
     uint8_t  axis_count;
     uint8_t  directionEnableMask;
-    uint16_t used_effects   = 0;
     bool     ffb_active     = false;
     FFB_BlockLoad_Feature_Data_t blockLoad_report;
     FFB_PIDPool_Feature_Data_t   pool_report;

@@ -31,7 +31,11 @@
  * ffb_axis_local.cpp
  *
  * Logic ported from OpenFFBoard Axis::calculateAxisEffects() and
- * Axis::updateEndstop(). Bit-for-bit equivalent at the math layer.
+ * Axis::updateEndstop(), with the same formulas. Two things are arranged
+ * differently so that a setup mistake cannot turn into a wrong force: every
+ * tunable is read from the config on each tick (the original caches the
+ * idle-spring scale), and the end-stop takes its overshoot from the scaled
+ * position alone (the original pairs it with a second copy of the angle).
  */
 
 #include "ffb/ffb_axis_local.h"
@@ -74,56 +78,64 @@ inline int8_t cliptest(T v, T lo, T hi) {
 
 namespace ffb {
 
-/* Construct from a config: build the damper/friction/inertia filters and cache
- * the idle-spring scale/clip derived from idle_spring_strength. */
+/* Construct from a config: build the damper/friction/inertia filters. */
 AxisLocalEffects::AxisLocalEffects(const AxisLocalConfig& c) : cfg(c) {
     setSamplerate(c.samplerate_hz);
-    setIdleSpringStrength(cfg.idle_spring_strength);
 }
 
-/* Set the idle-spring strength and recompute its cached scale and clip limit.
- * Has its own setter (instead of a plain config write) precisely because those
- * derived values must be recomputed whenever the strength changes. */
+/* Set the idle-spring strength. Equivalent to writing
+ * config().idle_spring_strength: both take effect on the next compute(). */
 void AxisLocalEffects::setIdleSpringStrength(uint8_t strength) {
-    /* Idle spring scale matches Axis::setIdleSpringStrength */
     cfg.idle_spring_strength = strength;
-    idle_spring_clip  = clip_t<int32_t>(static_cast<int32_t>(strength) * 35, 0, 10000);
-    idle_spring_scale = 0.5f + (static_cast<float>(strength) * 0.01f);
 }
 
 /* (Re)build the damper/friction/inertia low-pass coefficients for a new
- * control-loop rate. */
+ * control-loop rate. presetFc()/presetQ() keep a zero freq or q from reaching
+ * the coefficient math (see ffb_biquad.h). */
 void AxisLocalEffects::setSamplerate(float hz) {
     if (hz <= 0.0f) hz = FFB_DEFAULT_SAMPLERATE_HZ;
     cfg.samplerate_hz = hz;
     damper_filter.setBiquad(BiquadType::lowpass,
-                             cfg.damper_filter.freq / hz,
-                             cfg.damper_filter.q / 100.0f, 0.0f);
+                             presetFc(cfg.damper_filter, hz),
+                             presetQ(cfg.damper_filter) / 100.0f, 0.0f);
     friction_filter.setBiquad(BiquadType::lowpass,
-                               cfg.friction_filter.freq / hz,
-                               cfg.friction_filter.q / 100.0f, 0.0f);
+                               presetFc(cfg.friction_filter, hz),
+                               presetQ(cfg.friction_filter) / 100.0f, 0.0f);
     inertia_filter.setBiquad(BiquadType::lowpass,
-                              cfg.inertia_filter.freq / hz,
-                              cfg.inertia_filter.q / 100.0f, 0.0f);
+                              presetFc(cfg.inertia_filter, hz),
+                              presetQ(cfg.inertia_filter) / 100.0f, 0.0f);
 }
 
 /* Idle spring: a gentle auto-centering force, used only while host FFB is off.
- * Proportional to -position (pulls back toward center), clamped to the cached
- * limit so it never exceeds a comfortable strength. */
+ * Proportional to -position (pulls back toward center), clamped so it never
+ * exceeds a comfortable strength. Scale and clamp follow from the strength as
+ * in Axis::setIdleSpringStrength; they are worked out here, from the current
+ * config value, so a strength written through config() is not ignored. */
 int32_t AxisLocalEffects::updateIdleSpring(int32_t pos_scaled_16b) const {
-    int32_t f = static_cast<int32_t>(-pos_scaled_16b * idle_spring_scale);
-    return clip_t<int32_t>(f, -idle_spring_clip, idle_spring_clip);
+    const int32_t strength = cfg.idle_spring_strength;
+    const int32_t clip     = clip_t<int32_t>(strength * 35, 0, 10000);
+    const float   scale    = 0.5f + (static_cast<float>(strength) * 0.01f);
+    int32_t f = static_cast<int32_t>(-pos_scaled_16b * scale);
+    return clip_t<int32_t>(f, -clip, clip);
 }
 
 /* Software end-stop: 0 while the wheel is inside its travel range, otherwise a
  * stiff restoring torque proportional to how many degrees it has overshot the
  * limit, directed back toward center and clamped to +/-0x7fff. Relies on
  * pos_scaled_16b exceeding +/-0x7fff past the limit, which is why the metrics
- * helper leaves the scaled position un-clamped. */
-int32_t AxisLocalEffects::updateEndstop(int32_t pos_scaled_16b, float pos_degrees) const {
+ * helper leaves the scaled position un-clamped.
+ *
+ * Both the side and the size of the overshoot come from pos_scaled_16b, whose
+ * limits are +/-0x7fff by definition. The overshoot is therefore never
+ * negative and the torque can only point back into the range, whatever the
+ * sign convention of the encoder and whatever degrees_of_rotation says (a
+ * wrong value there only makes the wall softer or harder). */
+int32_t AxisLocalEffects::updateEndstop(int32_t pos_scaled_16b) const {
     int8_t clipdir = cliptest<int32_t>(pos_scaled_16b, -0x7fff, 0x7fff);
     if (clipdir == 0) return 0;
-    float addtorque = clipdir * pos_degrees - (cfg.degrees_of_rotation / 2.0f);
+    /* Counts past the limit, then degrees: 0xffff counts span the travel. */
+    float addtorque = static_cast<float>(clipdir * pos_scaled_16b - 0x7fff) *
+                      (cfg.degrees_of_rotation / 65535.0f);
     addtorque *= static_cast<float>(cfg.endstop_strength) * ENDSTOP_GAIN;
     addtorque *= -clipdir;
     return clip_t<int32_t>(static_cast<int32_t>(addtorque), -0x7fff, 0x7fff);
@@ -132,8 +144,11 @@ int32_t AxisLocalEffects::updateEndstop(int32_t pos_scaled_16b, float pos_degree
 /* Sum every axis-local "feel" effect into one torque to ADD on top of the host
  * torque: idle spring (only when FFB is off) + always-on damper/inertia/friction
  * + end-stop, clamped to +/-0x7fff. Each intensity of 0 skips that effect. The
- * caller is responsible for adding this to getAxisTorque() and clamping again. */
+ * caller is responsible for adding this to getAxisTorque() and clamping again.
+ * pos_degrees is not read any more (see updateEndstop); the parameter stays so
+ * existing callers keep compiling. */
 int32_t AxisLocalEffects::compute(const AxisState& m, float pos_degrees, bool ffb_on) {
+    (void)pos_degrees;
     int32_t axisEffectTorque = 0;
 
     if (!ffb_on) {
@@ -175,7 +190,7 @@ int32_t AxisLocalEffects::compute(const AxisState& m, float pos_degrees, bool ff
     }
 
     /* Endstop. */
-    axisEffectTorque += updateEndstop(m.pos_scaled_16b, pos_degrees);
+    axisEffectTorque += updateEndstop(m.pos_scaled_16b);
 
     return clip_t<int32_t>(axisEffectTorque, -0x7fff, 0x7fff);
 }

@@ -15,6 +15,8 @@ engine drops into **any** microcontroller project:
 - **No dependencies.** Just C++11. A C wrapper is included for C projects.
 - **Faithful math.** The waveform, condition, envelope and filter formulas are
   a direct port of OpenFFBoard and produce the same forces.
+- **Single precision.** Every calculation is done in `float`: the engine stays
+  on the FPU of a Cortex-M4F-class MCU and links no double-precision code.
 
 This document has **two parts**:
 
@@ -80,11 +82,18 @@ of them. You only ever touch five things:
 
 The same five touch points exist in both the C++ and the C API.
 
+> **One build-time prerequisite.** The library reads its compile-time options
+> from a header named `ffb_config.h` that lives in *your* project, not in the
+> library. Copy `examples/ffb_config.h` into your source tree and put its folder
+> on the include path before the first build — see
+> [§10](#10-compile-time-configuration).
+
 ---
 
 ## 2. Quick start in C++
 
-A complete single-axis wheel, using only the core engine:
+A complete single-axis wheel, using only the core engine. It assumes your
+project already has its `ffb_config.h` ([§10](#10-compile-time-configuration)):
 
 ```cpp
 #include "ffb/ffb.h"
@@ -125,12 +134,20 @@ void ffb_tick(void) {
 That is a fully working force-feedback wheel. Everything below is detail,
 options, and helpers.
 
+> **The wheel position still has to reach the host.** The engine handles the
+> force-feedback reports; the joystick *input* report that carries the wheel
+> angle and buttons to the game is your code's job. Its layout is in
+> [§6.1](#61-the-usb-stack).
+
 ---
 
 ## 3. Quick start in C
 
 The same device using the C wrapper (`ffb/ffb_c.h`). The wrapper holds one
 static `ffb::Library` under the hood, so `ffb_create()` is called exactly once.
+A C project needs the same `ffb_config.h`
+([§10](#10-compile-time-configuration)): the C headers never include it, but the
+library's own sources do.
 
 ```c
 #include "ffb/ffb_c.h"
@@ -190,14 +207,16 @@ ffb_lib_t* lib = ffb_create(/*axis_count=*/1, board_millis, board_micros);
 ```
 
 - `axis_count` — 1 for a wheel or single pedal, 2 for a joystick, etc. It must be
-  `<= FFB_MAX_AXIS` (compile-time, default 2; see [§10](#10-compile-time-configuration)).
+  `<= FFB_MAX_AXIS` (compile-time, default 2; see [§10](#10-compile-time-configuration));
+  a value outside `1..FFB_MAX_AXIS` is clamped into that range.
 - The two time functions are free-running counters in **milliseconds** and
   **microseconds**. They may overflow — every internal use is delta-based, so
-  wraparound is harmless. Keep them cheap (a register read), they are called
-  several times per tick. See [§6.3](#63-the-time-source).
+  wraparound is harmless. Keep them cheap (a register read); each is read once
+  per tick. See [§6.3](#63-the-time-source).
 
 The constructor allocates nothing. In C, the engine is a single static instance,
-so `ffb_create()` may be called **only once** per program.
+so `ffb_create()` may be called **only once** per program. In C++, a `Library`
+cannot be copied: keep one instance and pass it by reference or pointer.
 
 ### 4.2 Give the host the HID report descriptor
 
@@ -249,6 +268,11 @@ uint16_t on_usb_get_report(uint8_t id, uint8_t* buf, uint16_t maxlen) {
 
 `hidGet` returns the number of bytes it wrote into your buffer (0 if the report
 ID is not one it needs to answer). You never decode anything yourself.
+
+`len` must be the real number of bytes in `buf`: a report shorter than its
+layout is ignored. Whether a buffer starts with the report-ID byte depends on
+the report type, and USB stacks differ here — [§6.1](#61-the-usb-stack) lists
+what the library expects.
 
 > Pass the report ID **exactly as the host sent it**. Some stacks (notably
 > TinyUSB on the interrupt OUT endpoint) hand you `report_id == 0` with the real
@@ -413,6 +437,33 @@ points and forward.
 > have no ID byte — so the fix-up's `report_type`/`report_id == 0` guard skips
 > them.)
 
+**What the buffers must contain.** The library follows TinyUSB's conventions.
+On any other stack, check what it hands you and add or strip the ID byte in your
+glue:
+
+| Direction | Reports | Buffer contents |
+|---|---|---|
+| `hidOut` | Output reports (`0x01`–`0x0D`) | the whole report, **report-ID byte first** |
+| `hidOut` | Feature report Create New Effect (`0x11`) | the payload only, **no** ID byte |
+| `hidGet` | Feature replies Block Load (`0x12`), PID Pool (`0x13`) | the library writes the payload only, **no** ID byte; if your stack wants the ID in front, add it |
+| send-report callback | PID State (`0x02`) | the whole report, **report-ID byte first** (2 bytes) |
+
+**The joystick input report is yours.** Besides the force-feedback reports, the
+shipped descriptor declares the device's ordinary joystick input report — the
+one that tells the game where the wheel is. The library does not build or send
+it. It is report ID `1`, 24 bytes after the ID byte:
+
+```c
+typedef struct __attribute__((packed)) {
+    uint8_t buttons[8];   /* 64 buttons, one bit each                          */
+    int16_t axes[8];      /* X, Y, Z, Rx, Ry, Rz, Dial, Slider: -32767..32767  */
+} joystick_report_t;      /* 24 bytes                                          */
+```
+
+Put the wheel on `axes[0]` (X, the axis the force-feedback effects act on) and
+send the report at your USB poll rate — on TinyUSB
+`tud_hid_report(1, &report, sizeof(report))`, which adds the ID byte itself.
+
 **Two different descriptors — don't confuse them.** The library owns only one:
 
 | Descriptor | What it is | Who provides it |
@@ -474,6 +525,13 @@ uint32_t board_micros(void);   // microseconds since boot
 - If your MCU only has `millis()`, derive `micros()` from any 1 MHz hardware
   timer. The periodic and ramp effects use `micros()` for sub-millisecond phase;
   a coarse `micros` still works, just with coarser waveform timing.
+- The two should be views of the **same clock**, so that `micros() / 1000`
+  equals `millis()`: the engine takes whole milliseconds from `millis()` and
+  only the fraction of the current millisecond from `micros()`. If `micros()` is
+  missing (a null pointer) or runs apart from `millis()` — a free-running timer
+  started at another moment, say — the engine notices and times the effects in
+  whole milliseconds; nothing else changes.
+- Each counter is read once per tick, at the top of `calculate()`.
 
 ---
 
@@ -521,6 +579,10 @@ Useful calls:
 | Clear history at a position | `metrics.reset(deg)` | `ffb_metrics_reset(m, deg)` |
 | Custom filter coefficients | constructor's 3rd arg | `ffb_metrics_create_ex(...)` |
 
+The first angle you pass only seeds the history, so the wheel may sit anywhere
+at power-up without producing a burst of speed. Call `reset(deg)` when the
+position itself jumps — after re-centering the encoder, for example.
+
 Default filters: speed `{70 Hz, Q 0.55}`, accel `{55 Hz, Q 0.30}`. **Skip this
 helper entirely** if you already produce filtered speed/accel — just fill
 `AxisState` directly. In C, instances come from a static pool of `FFB_MAX_AXIS`
@@ -556,7 +618,7 @@ know your wheel has a physical range.
 #include "ffb/ffb_axis_local.h"
 
 ffb::AxisLocalConfig cfg;
-cfg.degrees_of_rotation  = 900.0f;   // MUST match your wheel
+cfg.degrees_of_rotation  = 900.0f;   // same value as the metrics helper
 cfg.idle_spring_strength = 40;       // auto-center when FFB off (0 = off)
 cfg.endstop_strength     = 127;      // wall stiffness at the limit
 cfg.damper_intensity     = 30;       // always-on damping
@@ -578,7 +640,7 @@ void tick(float raw_wheel_degrees) {
 
 // Runtime tuning (e.g. from a settings menu):
 local.config().endstop_strength = 200;   // live, read on every compute()
-local.setIdleSpringStrength(10);          // setter: caches a derived scale
+local.setIdleSpringStrength(10);          // same as config().idle_spring_strength = 10
 local.setSamplerate(2000.0f);             // setter: rebuilds filters
 ```
 
@@ -618,9 +680,12 @@ ffb_axis_local_set_samplerate(local, 2000.0f);
 ```
 
 `compute(metrics, pos_degrees, ffb_on)` takes the same `AxisState` you feed the
-engine, the **raw** wheel angle in degrees (the end-stop measures overshoot from
-this), and whether host FFB is active (the idle spring engages only when it is
-**off**).
+engine and whether host FFB is active (the idle spring engages only when it is
+**off**). The end-stop works from `metrics.pos_scaled_16b`: it engages where that
+value leaves `±0x7fff` and measures the overshoot from it, so it always pushes
+back toward the travel range. That is why the scaled position must reach the
+helper un-clamped. The wheel angle in the middle is no longer used — the
+parameter is kept so existing code compiles unchanged.
 
 ### 8.3 Parameters
 
@@ -631,7 +696,7 @@ this), and whether host FFB is active (the idle spring engages only when it is
 | `damper_intensity` | `30` | always-on damping (resists speed) |
 | `friction_intensity` | `0` | always-on friction |
 | `inertia_intensity` | `0` | always-on inertia (resists acceleration) |
-| `degrees_of_rotation` | `900` | full wheel travel; sets **where** the wall is |
+| `degrees_of_rotation` | `900` | full wheel travel, as given to the metrics helper; turns the overshoot into degrees |
 | `damper_filter {freq,q}` | `{60,55}` | damper low-pass (Hz, Q×100) |
 | `friction_filter {freq,q}` | `{50,20}` | friction low-pass |
 | `inertia_filter {freq,q}` | `{20,20}` | inertia low-pass |
@@ -640,18 +705,21 @@ this), and whether host FFB is active (the idle spring engages only when it is
 The end-stop is a one-sided spring that exists only *beyond* the limit: torque is
 proportional to overshoot in degrees, scaled by `endstop_strength × 25`, directed
 back toward center, and clamped to `±0x7fff`. With the default strength it reaches
-full motor torque about 10° past the limit.
+full motor torque about 10° past the limit. The limit itself is where the scaled
+position reaches `±0x7fff` — set by the travel you gave the metrics helper —
+and `degrees_of_rotation` converts the overshoot to degrees. Keep the two values
+equal; if they differ, the wall is only softer or harder than intended.
 
 ### 8.4 Runtime tuning — which path
 
-Most fields are read on every `compute()` so you can change them live; two are
-cached and need their setter.
+Most fields are read on every `compute()` so you can change them live; only the
+filters are cached and need their setter.
 
 | Parameter | C++ | C | When it applies |
 |---|---|---|---|
 | `endstop_strength` | `config().endstop_strength = n` | `ffb_axis_local_set_intensities(a, n, …)` | next tick |
 | `damper/friction/inertia_intensity` | `config().<field> = n` | `…set_intensities(a, …)` | next tick |
-| `idle_spring_strength` | `setIdleSpringStrength(n)` | `ffb_axis_local_set_idle_spring(a, n)` | **setter required** (cached scale) |
+| `idle_spring_strength` | `config().idle_spring_strength = n` or `setIdleSpringStrength(n)` | `ffb_axis_local_set_idle_spring(a, n)` | next tick |
 | `samplerate_hz` | `setSamplerate(hz)` | `ffb_axis_local_set_samplerate(a, hz)` | **setter required** (rebuilds filters) |
 | `degrees_of_rotation` | `config().degrees_of_rotation = d` | *create-time only* | next tick (C++) |
 | filter `freq`/`q` | `config().<f>.freq = …` then `setSamplerate(hz)` | *create-time only* | after rebuild |
@@ -711,28 +779,99 @@ Default condition gains `spring 64, damper 64, inertia 127, friction 254`;
 scalers `spring 16, damper 4, inertia 2, friction 1`; filter presets
 `constant {500,70}, friction {50,20}, damper {30,40}, inertia {15,20}`. What each
 value does is explained in [Part II §6](#6-projection-conditions-and-filtering).
+In any filter preset, here and in the two helpers, a `freq` of `0` means "no
+cutoff" (the filter passes everything) and a `q` of `0` is read as `1`.
 
 ---
 
 ## 10. Compile-time configuration
 
-Override any of these by defining them before including any `ffb/*` header, or on
-the compiler command line (`-DFFB_MAX_AXIS=1`). They live in `ffb/ffb_config.h`.
+The library has a handful of compile-time options. They are **not** set inside
+the library: they live in a header named **`ffb_config.h` that you create in your
+own project**, outside the library folder — the same arrangement as TinyUSB's
+`tusb_config.h` or FreeRTOS's `FreeRTOSConfig.h`.
+
+### 10.1 Creating your `ffb_config.h`
+
+1. Copy `examples/ffb_config.h` into your project. It is a template that lists
+   every option at its default value; next to your `tusb_config.h` is a natural
+   place for it.
+2. Edit the values.
+3. Put its folder on the include path of **every** source file that uses the
+   library — and that includes the library's own `src/*.cpp`. With the bundled
+   CMake that is `-DFFB_CONFIG_DIR=<folder>` ([§11](#11-building)); in any other
+   build system, add the folder with `-I` next to `include/`.
+
+A complete config for a single-axis wheel can be this short:
+
+```c
+/* my_project/config/ffb_config.h */
+#ifndef FFB_CONFIG_H_
+#define FFB_CONFIG_H_
+
+#define FFB_MAX_AXIS 1          /* a wheel has one axis */
+
+#endif
+```
+
+The library includes the file by name (`#include "ffb_config.h"`, from
+`ffb/ffb_options.h`), so the filename is fixed. If the file cannot be found, the
+build stops with an error that says so.
+
+### 10.2 The options
 
 | Macro | Default | Purpose | When to change |
 |---|---|---|---|
 | `FFB_MAX_AXIS` | `2` | max physical axes (1–3) | set to `1` for a wheel/pedal to shrink RAM |
-| `FFB_MAX_EFFECTS` | `40` | effect-slot pool size | lower on tiny MCUs (the host's pool report advertises it) |
+| `FFB_MAX_EFFECTS` | `40` | effect-slot pool size (1–127) | lower on tiny MCUs (the host's pool report advertises it) |
 | `FFB_DEFAULT_SAMPLERATE_HZ` | `1000.0f` | initial filter tuning rate | match your loop rate (or call `setSamplerate`) |
 | `FFB_ID_OFFSET` | `0` | added to every report ID | composite HID device sharing report IDs |
-| `FFB_LOG(msg)` | no-op | debug log hook | define to your logger to trace effect lifecycle |
+| `FFB_LOG(...)` | no-op | `printf`-style debug log hook | define to your logger to trace effect lifecycle |
 
-Memory is roughly `FFB_MAX_EFFECTS × (sizeof(Effect) + FFB_MAX_AXIS × sizeof(Biquad))`
-— about **9 KB** of static RAM with defaults, fine for a Cortex-M0+.
+Every option is optional: anything your `ffb_config.h` does not define keeps the
+default above. `ffb/ffb_options.h` fills those in and rejects an out-of-range
+`FFB_MAX_AXIS` or `FFB_MAX_EFFECTS` at compile time. The ceiling of 127 effects
+comes from the HID report descriptor, which declares the pool size as a one-byte
+signed maximum.
 
-```cpp
-#define FFB_LOG(msg) my_uart_print(msg)   // before including any ffb header
+Memory is roughly `FFB_MAX_EFFECTS × sizeof(Effect)` (each effect carries its own
+`FFB_MAX_AXIS` filters) — about **6.7 KB** of static RAM with defaults, fine for
+a Cortex-M0+. One axis brings it down to about 4.3 KB.
+
+`FFB_LOG` is called like `printf` (a format string plus arguments), so route it
+to something that accepts the same:
+
+```c
+/* in ffb_config.h */
+#include <stdio.h>
+#define FFB_LOG(...) printf(__VA_ARGS__)
 ```
+
+Once routed, the log traces the life of every effect (created, started, stopped,
+finished, freed), Device Control and gain changes, the engine being switched on
+together with the setup it runs with, and everything the library corrects or
+refuses: a report that is too short or names a block that does not exist, an
+axis count that had to be clamped, a missing time source, a `micros()` that does
+not track `millis()`, a filter preset with a zero in it. Messages come out in
+the context that called the library — your USB callback for the reports, your
+control tick for an effect running out — so route `FFB_LOG` to something that is
+safe to call there. Nothing is logged from a constructor, and reports that a game
+streams continuously (Set Constant Force and the like) are not logged at all.
+
+### 10.3 Why the file is yours
+
+`FFB_MAX_AXIS` and `FFB_MAX_EFFECTS` set the size of the engine's internal
+structures, so the library's sources and your code must be compiled with exactly
+the same values. A `#define` written above `#include "ffb/ffb.h"` in one of your
+files would never reach the library's `.cpp` files; a header that both sides
+include cannot disagree with itself. And because the file sits in your project,
+updating the library never overwrites your settings.
+
+An option can still be passed on the compiler command line instead
+(`-DFFB_MAX_AXIS=1`), as long as the flag reaches every source file and the macro
+is then left out of `ffb_config.h`.
+
+### 10.4 Custom report layouts
 
 If you need a different report layout (extra buttons, custom axis count), include
 `ffb/ffb_descriptor.h` — it re-exports the `HIDDESC_FFB_*` building-block macros so
@@ -747,20 +886,44 @@ to keep the parser in sync.
 
 ```sh
 cmake -B build -DFFB_BUILD_TESTS=ON
-cmake --build build          # produces libffb.a and runs the smoke test
+cmake --build build          # produces libffb.a and the smoke test
+ctest --test-dir build       # runs it (or run build/ffb_smoke_test directly)
 ```
 
 Options: `FFB_BUILD_EXAMPLES` (off), `FFB_BUILD_TESTS` (off),
-`FFB_BUILD_C_WRAPPER` (on). The target needs C++11 with extensions off.
+`FFB_BUILD_C_WRAPPER` (on), and `FFB_CONFIG_DIR` — the folder that holds your
+`ffb_config.h` ([§10](#10-compile-time-configuration)). The target needs C++11
+with extensions off.
+
+Built on its own, as above, the library falls back to the template in
+`examples/`. Pulled into your own project it has to be told where your config
+is, before `add_subdirectory()`:
+
+```cmake
+set(FFB_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/config)   # holds ffb_config.h
+add_subdirectory(Force-Feedback-Library)
+target_link_libraries(my_firmware PRIVATE ffb)
+```
+
+That folder becomes part of the `ffb` target's public include path, so the
+library and everything that links it are compiled against the same file. CMake
+prints which `ffb_config.h` it picked up when it configures.
 
 **Without CMake (drop into an existing firmware build):**
 
 1. Add `include/` to your include path.
-2. Always compile: `src/ffb_biquad.cpp`, `src/ffb_calculator.cpp`,
+2. Copy `examples/ffb_config.h` into your project and add **its** folder to the
+   include path as well ([§10](#10-compile-time-configuration)).
+3. Always compile: `src/ffb_biquad.cpp`, `src/ffb_calculator.cpp`,
    `src/ffb_parser.cpp`, `src/ffb_descriptor.cpp`.
-3. Compile `src/ffb_c.cpp` only if you use the C API.
-4. Compile `src/ffb_metrics.cpp` / `src/ffb_axis_local.cpp` only if you include
+4. Compile `src/ffb_c.cpp` only if you use the C API.
+5. Compile `src/ffb_metrics.cpp` / `src/ffb_axis_local.cpp` only if you include
    their headers. From C, also compile the matching `*_c.cpp` wrapper.
+
+A build system that gives you no way to add an include folder for a library's
+own sources (the Arduino IDE is one) cannot see a header kept in your project.
+There, place your `ffb_config.h` directly in the library's `include/` folder
+instead.
 
 No external libraries, no RTOS, no dynamic allocation. C++11 minimum;
 C++14/17 also build clean.
@@ -859,7 +1022,10 @@ Static support files (no dependencies):
   ffb_defs.h        wire-format report structs + report-ID / effect-type constants
   ffb_effect.h      the Effect struct (one effect's parameters + its filter slots)
   ffb_descriptor.*  the pre-built HID report descriptor byte arrays
-  ffb_config.h      compile-time knobs
+  ffb_options.h     includes your ffb_config.h, fills in defaults, validates
+
+Supplied by you (lives in your project, not in the library):
+  ffb_config.h      compile-time knobs (template: examples/ffb_config.h)
 
 Opt-in modules (never pulled in unless you include them):
   ffb_metrics.*     raw position → scaled position + filtered speed/accel
@@ -883,8 +1049,8 @@ it → you read it with `getAxisTorque()` and drive the motor.
   axis state into per-axis torque. *(was `EffectsCalculator`)*
 - **`Effect`** — a flat struct holding one effect's parameters and its biquad
   filter slots. The pool is a fixed `std::array`. *(was `FFB_Effect`)*
-- **`Biquad`** — a direct-form-I low-pass that smooths constant force and the
-  condition effects. *(was the `Filters` class)*
+- **`Biquad`** — a low-pass (transposed direct form II) that smooths constant
+  force and the condition effects. *(was the `Filters` class)*
 
 ---
 
@@ -910,7 +1076,8 @@ host; the parser implements each step:
 1. **Create New Effect** (Feature report `0x11`) — the host says "I want a
    CONSTANT effect." `HidParser::newEffect()` calls
    `Calculator::findFreeEffect(type)`, which returns the first slot whose
-   `type == NONE`. The parser records the block index and bumps `used_effects`.
+   `type == NONE`. The parser records the block index and the pool space that
+   is still free.
 2. **Block Load poll** (Feature GET `0x12`) — the host polls "did that allocation
    succeed, and at what index?" `hidGet()` fills a `FFB_BlockLoad_Feature_Data_t`
    with the 1-based index and `loadStatus = 1` (success).
@@ -919,8 +1086,9 @@ host; the parser implements each step:
    host fills in the numbers. Each maps to a `set*` handler that writes fields.
 4. **Effect Operation** (`0x0A`) — start / stop / start-solo. On start the parser
    stamps `startTime = millis() + startDelay` and sets `state = 1`.
-5. **Block Free** (`0x0B`) — `Calculator::freeEffect(idx)` resets the slot to a
-   default `Effect()` and clears `filter_active[]`, returning it to the pool.
+5. **Block Free** (`0x0B`) — `HidParser::freeEffect(idx)` has
+   `Calculator::freeEffect(idx)` reset the slot to a default `Effect()` and clear
+   `filter_active[]`, returning it to the pool.
 
 The host can also poll the **PID Pool** feature report (`0x13`) to learn
 `FFB_MAX_EFFECTS`, send **Device Control** (`0x0C`) to enable/disable/reset all
@@ -932,7 +1100,7 @@ FFB, and **Device Gain** (`0x0D`) to set the master gain.
 
 `hidOut(report_id, buffer, bufsize)` is a direct port of upstream
 `HidFFB::hidOut`. It subtracts `FFB_ID_OFFSET`, switches on the report ID, and
-reinterpret-casts the buffer to the matching packed struct:
+copies the buffer into the matching packed struct:
 
 | Report ID | Handler | Writes |
 |---|---|---|
@@ -948,10 +1116,13 @@ reinterpret-casts the buffer to the matching packed struct:
 | `0x0D` Device Gain | `setGain` | global gain |
 | `0x11` Create New Effect | `newEffect` | allocate a slot (arrives as a Feature report) |
 
-Because the structs in `ffb_defs.h` are `__attribute__((packed))` and laid out
-exactly like the USB wire format, decoding is a cast and a few field copies — no
-byte-by-byte parsing. The layouts line up by construction: the host computes its
-offsets from the same report descriptor the library ships.
+Because the structs in `ffb_defs.h` are packed and laid out exactly like the USB
+wire format, decoding is one `memcpy` and a few field copies — no byte-by-byte
+parsing. The layouts line up by construction: the host computes its offsets from
+the same report descriptor the library ships, and a `static_assert` per struct
+stops the build if a compiler pads one. A report with fewer bytes than its
+handler reads is dropped, and so is one that names an effect block outside the
+pool.
 
 `hidGet(report_id, reply, reqlen)` handles the two **Feature GET** replies the
 host polls — Block Load (`0x12`) and PID Pool (`0x13`) — by `memcpy`-ing the
@@ -961,16 +1132,18 @@ When an effect is created or operated on and a send-report callback is
 registered, the parser also assembles a PID State input report (`0x02`) and calls
 the callback so the host learns the effect-block state.
 
-> **Two small robustness fixes vs. upstream** live in the parser: `setCondition`
-> clamps the axis index instead of risking an out-of-bounds write, and the 3-axis
-> direction vector is written to the correct index. They change behavior only in
-> cases the original handled incorrectly.
+> **A few robustness fixes vs. upstream** live in the parser: `setCondition`
+> clamps the axis index instead of risking an out-of-bounds write, the 3-axis
+> direction vector is written to the correct index, short reports are dropped
+> instead of being read past their end, and the Block Load reply reports the pool
+> space that is really free (upstream never gives a freed block back in that
+> count). They change behavior only in cases the original handled incorrectly.
 
 ---
 
 ## 4. Calculator — the per-tick loop
 
-The whole tick, ported verbatim with the time source swapped in:
+The whole tick, with the time source swapped in:
 
 ```cpp
 void Calculator::calculate() {
@@ -978,18 +1151,18 @@ void Calculator::calculate() {
     if (!isActive()) return;                     // FFB disabled → all zero
 
     int32_t forces[FFB_MAX_AXIS] = {0};
-    uint32_t now_ms = time_source.millis();
+    TickTime now = sampleClocks();               // both clocks, read once
 
     for (each effect slot) {
-        // Expiry: a finite-duration effect past startTime+duration goes inactive;
-        // an effect still inside its startDelay is skipped this tick.
-        if (active && finite_duration) {
-            if (now_ms < startTime) continue;                 // start delay
-            if (now_ms - startTime > duration) state = INACTIVE;
-        }
         if (state == INACTIVE) continue;
 
-        int32_t force = calcNonConditionEffectForce(effect);  // base scalar
+        // An effect still inside its startDelay is skipped this tick;
+        // a finite-duration effect past its duration goes inactive.
+        if (startTime lies ahead of now.ms) continue;         // start delay
+        uint32_t elapsed_ms = now.ms - startTime;             // unsigned delta
+        if (finite_duration && elapsed_ms > duration) { state = INACTIVE; continue; }
+
+        int32_t force = calcNonConditionEffectForce(effect, elapsed_ms, now);  // base scalar
         for (axis) forces[axis] += calcComponentForce(effect, force, axis);
     }
 
@@ -997,8 +1170,9 @@ void Calculator::calculate() {
 }
 ```
 
-So each tick: zero, bail if inactive, walk every slot handling expiry, compute a
-base force, fan it out across axes, accumulate, clamp. Condition effects
+So each tick: zero, bail if inactive, read the clocks, walk every slot handling
+start delay and expiry, compute a base force, fan it out across axes,
+accumulate, clamp. Condition effects
 (spring/damper/friction/inertia) ignore the base `force` and read the axis state
 directly inside `calcComponentForce`.
 
@@ -1013,19 +1187,28 @@ a switch on `type`:
 
 - **Constant** — `force = magnitude`.
 - **Ramp** — linear interpolation from `startLevel` to `endLevel` across
-  `duration`, using elapsed time from `micros()`.
+  `duration`, using the elapsed time down to the sub-millisecond part; past the
+  duration it holds `endLevel`.
 - **Square** — `±magnitude` depending on whether `(elapsed + phase) mod period`
   is in the first or second half, plus `offset` (millisecond-aligned).
 - **Triangle / Sawtooth Up / Sawtooth Down** — compute a `remainder` within the
-  period from `micros()` and `phase`, then a linear slope between `offset ± magnitude`.
+  period from the elapsed time and `phase`, then a linear slope between
+  `offset ± magnitude`.
 - **Sine** — `offset + sin(2π·(t·freq + phase))·magnitude`, with `freq = 1/period`
   and `phase` normalized by 35999.
 
 The result is finally scaled by the effect's own gain:
 `return force_vector * effect->gain / 255`.
 
-> These waveform formulas (and their integer/float arithmetic) match OpenFFBoard,
-> so a given effect produces the same output as the original firmware.
+> These waveform formulas match OpenFFBoard, so a given effect produces the same
+> output as the original firmware. Two things are done differently on purpose.
+> The elapsed time is an unsigned difference to the effect's start, reduced
+> modulo the period in integer arithmetic before it becomes a `float` (see
+> [§9](#9-time-handling-and-overflow)), so the result does not depend on how long
+> the device has been powered. And everything is evaluated in single precision,
+> where the firmware lets a few terms promote to `double`: that keeps the whole
+> tick on a single-precision FPU, at the price of a rounding step — a count or
+> so out of 32767 — in an occasional sample.
 
 ---
 
@@ -1091,8 +1274,8 @@ original magnitude is preserved (important for constant force).
 
 ## 8. Biquad filters and the static-allocation design
 
-`ffb::Biquad` is a direct-form-I low-pass (the upstream `Filters` class with its
-one external `clip<>` inlined). Each effect that needs smoothing (constant,
+`ffb::Biquad` is a low-pass in transposed direct form II (the upstream `Filters`
+class with its one external `clip<>` inlined). Each effect that needs smoothing (constant,
 damper, friction, inertia) gets one biquad **per axis**, stored *inline* in the
 `Effect`:
 
@@ -1111,7 +1294,10 @@ This is the single structural rewrite versus upstream, which used
    `effect->filter[i].setBiquad(lowpass, fc/calcfrequency, q·0.01, 0)` and sets
    `filter_active[i] = true`. The per-type cutoff frequencies come from the
    filter-preset table (`constant {500,70}, friction {50,20}, damper {30,40},
-   inertia {15,20}` by default), divided by the sample rate.
+   inertia {15,20}` by default), divided by the sample rate. A zero in a preset
+   is read as upstream's `checkFilterCoeff()` reads it — `freq 0` as no cutoff,
+   `q 0` as `1` — and a cutoff at Nyquist makes the filter pass its input
+   through.
 2. `calcComponentForce()` — every `filter != nullptr` check became
    `filter_active[axis]`, and `filter->process()` became `filter.process()`.
 3. `freeEffect()` — clears `filter_active[]` instead of resetting smart pointers.
@@ -1122,24 +1308,44 @@ coefficients of every active filter (`updateFiltersForType` /
 `setFilterProfileId` do the same for a profile change).
 
 The upshot: **no heap is ever touched at runtime.** The entire effect pool,
-including all filters, is part of the `Library` object's storage — about 9 KB of
-BSS on a 2-axis, 40-effect default, fixed at compile time.
+including all filters, is part of the `Library` object's storage — about 6.7 KB
+of BSS on a 2-axis, 40-effect default, fixed at compile time.
 
 ---
 
 ## 9. Time handling and overflow
 
-Everything time-related flows through the two user counters via
-`Calculator::millisNow()` / `microsNow()`:
+Everything time-related flows through the two user counters, which
+`calculate()` reads once per tick (`sampleClocks()`):
 
-- Effect **duration / expiry** and **envelopes** use `millis()`.
-- **Ramp** and **periodic** waveforms use `micros()` for fine phase resolution.
 - Effect **start time** is `millis() + startDelay`, stamped when the host starts
   the effect.
+- An effect's age is `elapsed_ms = now_ms - startTime`. Effect **start delay**,
+  **duration / expiry**, **envelopes** and the square wave use it directly.
+- **Ramp**, **sine**, **triangle** and **sawtooth** add the fraction of the
+  current millisecond for fine phase resolution: `sub_us = micros() -
+  millis()·1000`.
+- The periodic generators take `elapsed_ms` modulo the period before any
+  conversion to `float`, so the phase stays exact however long the effect — or
+  the device — has been running.
 
 All comparisons are deltas (`now - startTime`), so a 32-bit counter wrapping
 (~49 days for millis, ~71 minutes for micros) causes no glitch — the subtraction
-wraps consistently in unsigned arithmetic.
+wraps consistently in unsigned arithmetic. The "is the start still ahead?" test
+is wrap-safe too: a start time counts as pending only while it lies at most one
+maximum start delay (65.5 s) ahead of the clock.
+
+`sub_us` is meaningful only when both counters are views of one clock. If it
+comes out implausibly large (50 ms or more), or there is no `micros()` at all,
+it is taken as `0` and the effects are timed in whole milliseconds. The margin
+is that generous so that a `millis()` advancing in coarse steps — a 10 ms RTOS
+tick, for instance — still gets its fine timing from `micros()`.
+
+> This is where the engine departs from the firmware it was ported from.
+> OpenFFBoard subtracts the raw counters in floating point
+> (`micros() - startTime·1000`), which stops producing the waveform once
+> `micros()` has wrapped — about 71 minutes after power-up — and it applies the
+> start delay only to effects with a finite duration.
 
 ---
 
@@ -1154,7 +1360,7 @@ byte-identical to upstream OpenFFBoard's generated descriptors. `descriptor1Axis
 
 The descriptor and the packed structs in `ffb_defs.h` are two views of the same
 contract: the host parses the descriptor to know where, say, `magnitude` sits in
-the Set Constant Force report, and the library casts the incoming bytes to a
+the Set Constant Force report, and the library copies the incoming bytes into a
 struct with that exact layout. If you build a custom descriptor with the
 `ffb_descriptor.h` macros, the report structs must still match.
 
@@ -1171,20 +1377,27 @@ accel = (speed_raw - last_speed_raw) · samplerate;  accel = accelFilter.process
 
 and `scalePos()` is `Axis::scaleEncValue()` — `(0xffff / degrees) · angle`,
 intentionally **un-clamped** so a wheel past its limit produces a scaled value
-beyond `±0x7fff`. That overshoot is what the end-stop reads.
+beyond `±0x7fff`. That overshoot is what the end-stop reads. The first sample
+after construction or `reset()` seeds `prev_pos`, as the firmware seeds its
+metrics with the real angle, so it yields zero speed rather than a jump from 0°.
 
 **`AxisLocalEffects`** (`ffb_axis_local.cpp`) merges OpenFFBoard's
 `Axis::calculateAxisEffects()` and `Axis::updateEndstop()` into one `compute()`:
 
 - **idle spring** — `clip(-pos · idle_scale, -idle_clip, idle_clip)`, active only
-  when FFB is off; `idle_scale = 0.5 + strength·0.01`, `idle_clip = strength·35`.
+  when FFB is off; `idle_scale = 0.5 + strength·0.01`, `idle_clip = strength·35`,
+  both worked out from the current strength on each call.
 - **damper / inertia / friction** — always-on, intensity-scaled versions
   (`metric · intensity · ratio`, with no deadband/coefficient/saturation), each
   clipped to `±20000` and low-pass filtered. Friction reuses the host effect's
   half-sine ramp-up near zero speed.
 - **end-stop** — gated by `cliptest(pos_scaled, -0x7fff, 0x7fff)`: zero inside the
   range, otherwise a restoring torque proportional to degrees of overshoot, scaled
-  by `endstop_strength · 25` and directed back toward center.
+  by `endstop_strength · 25` and directed back toward center. The overshoot is
+  `(|pos_scaled| - 0x7fff) · degrees_of_rotation / 0xffff`. The firmware computes
+  the same quantity as `|posDegrees| - degrees_of_rotation / 2` from a second copy
+  of the angle; deriving it from the scaled position alone means the two can
+  never disagree, so the torque cannot end up pointing out of the range.
 
 The caller sums `compute()`'s result with `getAxisTorque()` and clamps — upstream
 did this inside `Axis::updateTorque`; the library leaves the summation to you.
@@ -1211,6 +1424,25 @@ edits are only at the boundaries:
 Class renames: `EffectsCalculator → Calculator`, `HidFFB → HidParser`,
 `FFB_Effect → Effect`, `Filters → Biquad`. The per-axis "feel" effects and the
 metrics math moved out of the firmware's `Axis` class into the two opt-in helpers.
+
+Where the library deliberately behaves differently from the firmware:
+
+- **Single precision throughout.** A speed decision: no double-precision
+  arithmetic anywhere in the tick. Outputs match the firmware to within a
+  rounding step ([§5](#5-waveform-generators)).
+- **Effect timing by unsigned differences**, immune to both counters wrapping
+  and to uptime; the start delay applies to infinite-duration effects as well;
+  a ramp holds its end level once its duration has passed
+  ([§9](#9-time-handling-and-overflow)).
+- **A periodic effect with no period yet** (started before its Set Periodic
+  report) stays silent instead of dividing by zero.
+- **Reports are length-checked** and the Block Load reply reports the pool space
+  that is really free ([§3](#3-hidparser--decoding-inbound-reports)).
+- **Filter presets** with a zero in them, or a cutoff at Nyquist, give a
+  well-defined filter ([§8](#8-biquad-filters-and-the-static-allocation-design)).
+- **The axis-local helper** reads the idle-spring strength live and takes the
+  end-stop overshoot from the scaled position
+  ([§11](#11-the-optional-helpers-internally)).
 
 ---
 
