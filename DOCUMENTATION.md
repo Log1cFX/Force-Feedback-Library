@@ -630,7 +630,7 @@ void tick(float raw_wheel_degrees) {
     lib.calculate();
 
     int32_t host  = lib.getAxisTorque(0);
-    int32_t feel  = local.compute(st, raw_wheel_degrees, lib.isActive());
+    int32_t feel  = local.compute(st, lib.isActive());
 
     int32_t total = host + feel;
     if (total >  0x7fff) total =  0x7fff;
@@ -664,8 +664,7 @@ void tick(float raw_wheel_degrees) {
     ffb_calculate(lib);
 
     int32_t host  = ffb_get_axis_torque(lib, 0);
-    int32_t feel  = ffb_axis_local_compute(local, &st, raw_wheel_degrees,
-                                           ffb_is_active(lib));
+    int32_t feel  = ffb_axis_local_compute(local, &st, ffb_is_active(lib));
     int32_t total = host + feel;
     if (total >  0x7fff) total =  0x7fff;
     if (total < -0x7fff) total = -0x7fff;
@@ -679,13 +678,12 @@ ffb_axis_local_set_idle_spring(local, 10);
 ffb_axis_local_set_samplerate(local, 2000.0f);
 ```
 
-`compute(metrics, pos_degrees, ffb_on)` takes the same `AxisState` you feed the
-engine and whether host FFB is active (the idle spring engages only when it is
-**off**). The end-stop works from `metrics.pos_scaled_16b`: it engages where that
-value leaves `±0x7fff` and measures the overshoot from it, so it always pushes
-back toward the travel range. That is why the scaled position must reach the
-helper un-clamped. The wheel angle in the middle is no longer used — the
-parameter is kept so existing code compiles unchanged.
+`compute(metrics, ffb_on)` takes the same `AxisState` you feed the engine and
+whether host FFB is active (the idle spring engages only when it is **off**).
+The end-stop works from `metrics.pos_scaled_16b`: it engages where that value
+leaves `±0x7fff` and measures the overshoot from it, so it always pushes back
+toward the travel range. That is why the scaled position must reach the helper
+un-clamped.
 
 ### 8.3 Parameters
 

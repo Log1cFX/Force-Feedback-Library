@@ -475,7 +475,8 @@ static int test_helpers() {
     for (int i = 0; i < 10; ++i) st = metrics.update(200.0f);
     if (st.speed != 0.0f || st.accel != 0.0f || st.pos_scaled_16b != 14563) {
         std::printf("FAIL: wheel at rest at 200 deg reads pos %d, speed %.1f, accel %.1f\n",
-                    st.pos_scaled_16b, st.speed, st.accel);
+                    st.pos_scaled_16b, static_cast<double>(st.speed),
+                    static_cast<double>(st.accel));
         return 1;
     }
     std::printf("OK: metrics helper starts cleanly away from centre\n");
@@ -485,7 +486,7 @@ static int test_helpers() {
     ffb::AxisLocalEffects local;
     local.config().damper_intensity     = 0;
     local.config().idle_spring_strength = 40;
-    int32_t idle = local.compute(ffb::AxisState(16384, 0.0f, 0.0f), 225.0f, /*ffb_on=*/false);
+    int32_t idle = local.compute(ffb::AxisState(16384, 0.0f, 0.0f), /*ffb_on=*/false);
     if (idle != -1400) {
         std::printf("FAIL: idle spring via config() gave %d, expected -1400\n", idle);
         return 1;
@@ -495,9 +496,9 @@ static int test_helpers() {
     /* End-stop: 10 degrees past either limit of a 900 degree wheel pushes
      * back toward centre with 10 * 127 * 25 = 31750 (less a rounding step). */
     ffb::MetricsBuilder wheel(900.0f, 1000.0f);
-    int32_t right = local.compute(wheel.update(460.0f), 460.0f, true);
+    int32_t right = local.compute(wheel.update(460.0f), true);
     wheel.reset(-460.0f);
-    int32_t left  = local.compute(wheel.update(-460.0f), -460.0f, true);
+    int32_t left  = local.compute(wheel.update(-460.0f), true);
     if (right > -31650 || right < -31800 || left != -right) {
         std::printf("FAIL: end-stop 10 deg past the limits gave %d (right) and %d (left)\n",
                     right, left);
@@ -507,9 +508,9 @@ static int test_helpers() {
      * 900 degree wheel but the axis state comes from a 540 degree one
      * (10 degrees past its 270 degree limit here). */
     ffb::MetricsBuilder small_wheel(540.0f, 1000.0f);
-    int32_t small_right = local.compute(small_wheel.update(280.0f), 280.0f, true);
+    int32_t small_right = local.compute(small_wheel.update(280.0f), true);
     small_wheel.reset(-280.0f);
-    int32_t small_left  = local.compute(small_wheel.update(-280.0f), -280.0f, true);
+    int32_t small_left  = local.compute(small_wheel.update(-280.0f), true);
     if (small_right >= 0 || small_left <= 0) {
         std::printf("FAIL: end-stop with a mismatched degrees_of_rotation gave %d (right) "
                     "and %d (left)\n", small_right, small_left);

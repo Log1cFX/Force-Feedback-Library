@@ -82,10 +82,9 @@ ffb_axis_local_t* ffb_axis_local_create(const ffb_axis_local_config_t* cfg);
  * the host-requested torque from ffb_get_axis_torque(). metrics is the same
  * axis state you feed the engine (its position must not be clamped: the
  * end-stop engages where it leaves +/-0x7fff); ffb_on is whether host FFB is
- * active (idle spring engages when it is not). pos_degrees is accepted for
- * source compatibility and not used. */
+ * active (idle spring engages when it is not). */
 int32_t ffb_axis_local_compute(ffb_axis_local_t* a, const ffb_axis_state_t* metrics,
-                               float pos_degrees, bool ffb_on);
+                               bool ffb_on);
 
 /* Rebuild filter coefficients for a new control-loop rate. */
 void ffb_axis_local_set_samplerate(ffb_axis_local_t* a, float hz);

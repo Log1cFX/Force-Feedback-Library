@@ -87,8 +87,9 @@ public:
      * Everything is derived from `metrics`. The end-stop engages where
      * metrics.pos_scaled_16b leaves +/-0x7fff, so that value must not be
      * clamped (the metrics helper leaves it un-clamped for this reason).
-     * pos_degrees is accepted for source compatibility and not used. */
-    int32_t compute(const AxisState& metrics, float pos_degrees, bool ffb_on);
+     * ffb_on is whether host FFB is active: the idle spring engages only
+     * when it is not. */
+    int32_t compute(const AxisState& metrics, bool ffb_on);
 
     /* Update samplerate (rebuilds filter coefficients). */
     void setSamplerate(float hz);

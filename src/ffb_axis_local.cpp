@@ -145,10 +145,9 @@ int32_t AxisLocalEffects::updateEndstop(int32_t pos_scaled_16b) const {
  * torque: idle spring (only when FFB is off) + always-on damper/inertia/friction
  * + end-stop, clamped to +/-0x7fff. Each intensity of 0 skips that effect. The
  * caller is responsible for adding this to getAxisTorque() and clamping again.
- * pos_degrees is not read any more (see updateEndstop); the parameter stays so
- * existing callers keep compiling. */
-int32_t AxisLocalEffects::compute(const AxisState& m, float pos_degrees, bool ffb_on) {
-    (void)pos_degrees;
+ * The axis state is the only input: there is no separate wheel angle (see
+ * updateEndstop). */
+int32_t AxisLocalEffects::compute(const AxisState& m, bool ffb_on) {
     int32_t axisEffectTorque = 0;
 
     if (!ffb_on) {

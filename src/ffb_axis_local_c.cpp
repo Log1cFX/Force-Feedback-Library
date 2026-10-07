@@ -108,16 +108,15 @@ ffb_axis_local_t* ffb_axis_local_create(const ffb_axis_local_config_t* cfg) {
 }
 
 /* Compute the axis-local "feel" torque to ADD on top of the host torque.
- * Unpacks the C axis state, then forwards to AxisLocalEffects::compute()
- * (which no longer reads pos_degrees). */
+ * Unpacks the C axis state, then forwards to AxisLocalEffects::compute(). */
 int32_t ffb_axis_local_compute(ffb_axis_local_t* a, const ffb_axis_state_t* metrics,
-                               float pos_degrees, bool ffb_on) {
+                               bool ffb_on) {
     if (!a || !metrics) return 0;
     ffb::AxisState s;
     s.pos_scaled_16b = metrics->pos_scaled_16b;
     s.speed          = metrics->speed;
     s.accel          = metrics->accel;
-    return as_a(a)->compute(s, pos_degrees, ffb_on);
+    return as_a(a)->compute(s, ffb_on);
 }
 
 /* Rebuild the damper/friction/inertia filter coefficients for a new rate. */
